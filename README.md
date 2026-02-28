@@ -4,7 +4,7 @@
 
 Real-time USB device monitor for Windows with a neon-themed GUI and CLI mode. Watches for connect/disconnect events via WMI polling and logs everything with timestamps.
 
-![Device History v0.3.0](screenshot.png)
+![Device History v0.3.1](screenshot.png)
 
 ## Features
 
@@ -14,6 +14,7 @@ Real-time USB device monitor for Windows with a neon-themed GUI and CLI mode. Wa
 - **File logging** — persistent log at `device-history.log`
 - **CLI mode** — `--cli` flag for terminal output with colored text
 - **Theme picker** — Neon (dark), Light, and Mids themes
+- **Update checker** — silently checks GitHub for new releases on startup
 - **Rainbow gradient** — because why not
 
 ## Install
@@ -49,6 +50,8 @@ device-history --cli
 - **WMI** — Windows Management Instrumentation for device queries
 - **chrono** — timestamps
 - **colored** — CLI terminal colors
+- **ureq** — HTTP client for update checking
+- **open** — opens URLs in default browser
 
 ## How It Works
 

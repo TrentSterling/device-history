@@ -410,17 +410,53 @@ struct DeviceHistoryApp {
     colors: ThemeColors,
     needs_theme_apply: bool,
     show_about: bool,
+    update_available: Arc<Mutex<Option<String>>>,
 }
 
 impl DeviceHistoryApp {
     fn new(state: Arc<Mutex<AppState>>) -> Self {
         let theme = Theme::Neon;
+        let update_available = Arc::new(Mutex::new(None));
+
+        // Background update check
+        let update_flag = update_available.clone();
+        thread::spawn(move || {
+            let current = env!("CARGO_PKG_VERSION");
+            let resp = ureq::get("https://api.github.com/repos/TrentSterling/device-history/releases/latest")
+                .set("User-Agent", "device-history")
+                .call();
+            if let Ok(resp) = resp {
+                if let Ok(body) = resp.into_string() {
+                    // Simple JSON parse for "tag_name":"vX.Y.Z"
+                    if let Some(start) = body.find("\"tag_name\"") {
+                        let rest = &body[start..];
+                        if let Some(colon) = rest.find(':') {
+                            let after_colon = rest[colon + 1..].trim_start();
+                            if after_colon.starts_with('"') {
+                                let val_start = 1;
+                                if let Some(val_end) = after_colon[val_start..].find('"') {
+                                    let tag = &after_colon[val_start..val_start + val_end];
+                                    let latest = tag.trim_start_matches('v');
+                                    if latest != current {
+                                        if let Ok(mut u) = update_flag.lock() {
+                                            *u = Some(latest.to_string());
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
         Self {
             state,
             theme,
             colors: theme.colors(),
             needs_theme_apply: true,
             show_about: false,
+            update_available,
         }
     }
 }
@@ -455,10 +491,28 @@ impl eframe::App for DeviceHistoryApp {
                     );
                     ui.add_space(4.0);
                     ui.label(
-                        egui::RichText::new("v0.3.0")
+                        egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
                             .size(11.0)
                             .color(tc.text_muted),
                     );
+
+                    // Update available banner
+                    if let Ok(guard) = self.update_available.lock() {
+                        if let Some(ver) = guard.as_ref() {
+                            ui.add_space(8.0);
+                            let btn = egui::Button::new(
+                                egui::RichText::new(format!("Update: v{}", ver))
+                                    .size(11.0)
+                                    .color(tc.orange),
+                            )
+                            .fill(egui::Color32::TRANSPARENT)
+                            .stroke(egui::Stroke::new(1.0, tc.orange))
+                            .rounding(4.0);
+                            if ui.add(btn).clicked() {
+                                let _ = open::that("https://github.com/TrentSterling/device-history/releases/latest");
+                            }
+                        }
+                    }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         // Status (rightmost)
@@ -839,23 +893,25 @@ impl eframe::App for DeviceHistoryApp {
 fn run_cli() {
     use colored::*;
 
+    let ver = env!("CARGO_PKG_VERSION");
+    let title = format!("Device History v{}", ver);
+    let tagline = "WTF just disconnected?";
+    let width = 39;
     println!(
         "{}",
-        "\u{2554}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2557}"
-            .bright_cyan()
+        format!("\u{2554}{}\u{2557}", "\u{2550}".repeat(width)).bright_cyan()
     );
     println!(
         "{}",
-        "\u{2551}       Device History v0.3.0           \u{2551}".bright_cyan()
+        format!("\u{2551}{:^w$}\u{2551}", title, w = width).bright_cyan()
     );
     println!(
         "{}",
-        "\u{2551}  WTF just disconnected?               \u{2551}".bright_cyan()
+        format!("\u{2551}{:^w$}\u{2551}", tagline, w = width).bright_cyan()
     );
     println!(
         "{}",
-        "\u{255a}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{2550}\u{255d}"
-            .bright_cyan()
+        format!("\u{255a}{}\u{255d}", "\u{2550}".repeat(width)).bright_cyan()
     );
     println!();
 
