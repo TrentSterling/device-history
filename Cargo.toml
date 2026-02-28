@@ -1,0 +1,16 @@
+[package]
+name = "device-history"
+version = "0.3.0"
+edition = "2021"
+description = "WTF just disconnected? USB device monitor with GUI and CLI"
+
+[dependencies]
+wmi = "0.14"
+serde = { version = "1", features = ["derive"] }
+chrono = "0.4"
+colored = "2"
+eframe = "0.30"
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[build-dependencies]
+winresource = "0.1"
