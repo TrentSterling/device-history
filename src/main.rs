@@ -1,3 +1,6 @@
+// Hide console window in GUI mode (release builds only)
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use chrono::Local;
 use eframe::egui;
 use serde::Deserialize;
@@ -891,6 +894,19 @@ impl eframe::App for DeviceHistoryApp {
 // ── CLI mode ───────────────────────────────────────────────────
 
 fn run_cli() {
+    // Attach to parent console (or allocate one) when windows_subsystem = "windows"
+    #[cfg(windows)]
+    unsafe {
+        extern "system" {
+            fn AttachConsole(dwProcessId: u32) -> i32;
+            fn AllocConsole() -> i32;
+        }
+        if AttachConsole(0xFFFFFFFF) == 0 {
+            // No parent console — allocate our own
+            AllocConsole();
+        }
+    }
+
     use colored::*;
 
     let ver = env!("CARGO_PKG_VERSION");
