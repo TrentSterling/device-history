@@ -24,3 +24,32 @@ export function capacityColor(pct: number): string {
   if (pct < 90) return 'var(--yellow)';
   return 'var(--red)';
 }
+
+export function relativeDate(isoString: string): string {
+  const date = new Date(isoString);
+  const now = new Date();
+  const diffMs = now.getTime() - date.getTime();
+  const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
+
+  if (diffDays === 0) return "Today";
+  if (diffDays === 1) return "Yesterday";
+  if (diffDays < 7) return `${diffDays}d ago`;
+  if (diffDays < 30) return `${Math.floor(diffDays / 7)}w ago`;
+
+  return date.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+}
+
+export function deviceClassCategory(className: string | undefined): string {
+  if (!className) return "Other";
+  const c = className.toLowerCase();
+  if (c.includes("disk") || c.includes("storage") || c.includes("cdrom")) return "Storage";
+  if (c.includes("hid") || c.includes("keyboard") || c.includes("mouse")) return "HID";
+  if (c.includes("audio") || c.includes("sound")) return "Audio";
+  if (c.includes("bluetooth")) return "Bluetooth";
+  if (c.includes("net") || c.includes("wireless")) return "Network";
+  return "Other";
+}
+
+export type DeviceClassFilter = "All" | "Storage" | "HID" | "Audio" | "Bluetooth" | "Network" | "Other";
+
+export const CLASS_FILTERS: DeviceClassFilter[] = ["All", "Storage", "HID", "Audio", "Bluetooth", "Network", "Other"];
