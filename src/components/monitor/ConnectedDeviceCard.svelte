@@ -13,18 +13,6 @@
     app.selectDevice(isSelected ? null : device.device_id);
   }
 
-  function classEmoji(cls: string): string {
-    const c = cls.toLowerCase();
-    if (c.includes('bluetooth')) return '\uD83D\uDD35';
-    if (c.includes('scsi') || c.includes('disk')) return '\uD83D\uDCBF';
-    if (c.includes('hid') || c.includes('keyboard')) return '\u2328\uFE0F';
-    if (c.includes('mouse')) return '\uD83D\uDDB1\uFE0F';
-    if (c.includes('audio') || c.includes('sound')) return '\uD83D\uDD0A';
-    if (c.includes('camera') || c.includes('video')) return '\uD83D\uDCF7';
-    if (c.includes('net') || c.includes('wireless')) return '\uD83D\uDCF6';
-    if (c.includes('print')) return '\uD83D\uDDA8\uFE0F';
-    return '\uD83D\uDD0C';
-  }
 </script>
 
 <div class="device-wrapper">

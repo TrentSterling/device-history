@@ -136,8 +136,23 @@ class AppState {
       const prevCount = this.events.length;
       this.applySnapshot(event.payload);
 
-      // Show toast for new connect/disconnect events
+      // Show toast and play sound for new connect/disconnect events
       const newEvents = this.events.slice(prevCount);
+      if (newEvents.length > 0 && this.soundEnabled) {
+        try {
+          const ctx = new AudioContext();
+          const osc = ctx.createOscillator();
+          const gain = ctx.createGain();
+          osc.connect(gain);
+          gain.connect(ctx.destination);
+          osc.frequency.value = 880;
+          osc.type = "sine";
+          gain.gain.setValueAtTime(0.15, ctx.currentTime);
+          gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.15);
+          osc.start();
+          osc.stop(ctx.currentTime + 0.15);
+        } catch {}
+      }
       for (const evt of newEvents.slice(-3)) {
         const icon = evt.kind === "connect" ? "\u{1F50C}" : "\u23CF\uFE0F";
         const verb = evt.kind === "connect" ? "Connected" : "Disconnected";
