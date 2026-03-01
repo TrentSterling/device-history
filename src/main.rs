@@ -2355,17 +2355,17 @@ impl eframe::App for DeviceHistoryApp {
 
                         filtered.sort_by(|a, b| {
                             let cmp = match sort_mode {
-                                SortMode::Status => b
+                                SortMode::Status => a
                                     .currently_connected
-                                    .cmp(&a.currently_connected)
+                                    .cmp(&b.currently_connected)
                                     .then_with(|| {
                                         a.name.to_lowercase().cmp(&b.name.to_lowercase())
                                     }),
                                 SortMode::Name => {
                                     a.name.to_lowercase().cmp(&b.name.to_lowercase())
                                 }
-                                SortMode::LastSeen => b.last_seen.cmp(&a.last_seen),
-                                SortMode::TimesSeen => b.times_seen.cmp(&a.times_seen),
+                                SortMode::LastSeen => a.last_seen.cmp(&b.last_seen),
+                                SortMode::TimesSeen => a.times_seen.cmp(&b.times_seen),
                                 SortMode::FirstSeen => a.first_seen.cmp(&b.first_seen),
                             };
                             if sort_ascending {
