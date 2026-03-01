@@ -11,6 +11,9 @@
   <span class="sep">·</span>
   <span class="footer-item log-path">📄 device-history.log</span>
   <span class="spacer"></span>
+  <button class="footer-btn" onclick={() => app.exportEventsCSV()} title="Export events to CSV">
+    Export CSV
+  </button>
   <button class="footer-link" onclick={() => app.openUrl('https://tront.xyz')}>
     ⚡ tront.xyz
   </button>
@@ -57,6 +60,20 @@
   }
   .spacer {
     flex: 1;
+  }
+  .footer-btn {
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text-muted);
+    font-size: 11px;
+    padding: 3px 10px;
+    cursor: pointer;
+    transition: all 150ms;
+  }
+  .footer-btn:hover {
+    border-color: var(--accent);
+    color: var(--accent);
   }
   .footer-link {
     font-size: 11px;

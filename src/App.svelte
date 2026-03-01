@@ -7,7 +7,21 @@
   import Notification from './components/Notification.svelte';
   import MonitorTab from './components/monitor/MonitorTab.svelte';
   import KnownDevicesTab from './components/known/KnownDevicesTab.svelte';
+
+  function handleKeydown(e: KeyboardEvent) {
+    if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
+
+    if (e.key === "Escape" && app.selectedDevice) {
+      app.selectDevice(null);
+      return;
+    }
+
+    if (e.key === "1") { app.setActiveTab("monitor"); return; }
+    if (e.key === "2") { app.setActiveTab("known"); return; }
+  }
 </script>
+
+<svelte:window onkeydown={handleKeydown} />
 
 <div class={themeClass(app.theme)} id="app-root">
   <Header />
