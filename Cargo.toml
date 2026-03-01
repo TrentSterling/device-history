@@ -1,6 +1,6 @@
 [package]
 name = "device-history"
-version = "0.5.0"
+version = "0.5.1"
 edition = "2021"
 description = "WTF just disconnected? USB device monitor with GUI and CLI"
 

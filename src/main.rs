@@ -1057,13 +1057,111 @@ fn draw_device_detail_panel(
         ui.set_width(ui.available_width());
         ui.spacing_mut().item_spacing.y = 4.0;
 
-        // ── Header: device name ──
-        ui.label(
-            egui::RichText::new(device_name)
-                .strong()
-                .size(14.0)
-                .color(tc.text),
-        );
+        // ── Header: drive info FIRST if storage device ──
+        if let Some(si) = storage_info {
+            // Big drive letter + volume name as the headline
+            for vol in &si.volumes {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(&vol.drive_letter)
+                            .color(tc.green)
+                            .strong()
+                            .monospace()
+                            .size(20.0),
+                    );
+                    if !vol.volume_name.is_empty() {
+                        ui.label(
+                            egui::RichText::new(format!("\"{}\"", vol.volume_name))
+                                .color(tc.text)
+                                .strong()
+                                .size(16.0),
+                        );
+                    }
+                    ui.label(
+                        egui::RichText::new(format!("({})", vol.file_system))
+                            .color(tc.text_sec)
+                            .size(12.0),
+                    );
+                });
+
+                // Capacity bar right under the headline
+                if vol.total_bytes > 0 {
+                    let free_str = format_bytes(vol.free_bytes);
+                    let total_str = format_bytes(vol.total_bytes);
+                    let used_frac = 1.0 - (vol.free_bytes as f32 / vol.total_bytes as f32);
+                    let bar_color = if used_frac < 0.7 {
+                        tc.green
+                    } else if used_frac < 0.9 {
+                        tc.yellow
+                    } else {
+                        tc.red
+                    };
+                    let bar_width = (ui.available_width() - 10.0).max(100.0);
+                    let bar_height = 10.0;
+                    let (bar_rect, _) = ui.allocate_exact_size(
+                        egui::Vec2::new(bar_width, bar_height),
+                        egui::Sense::hover(),
+                    );
+                    let painter = ui.painter_at(bar_rect);
+                    painter.rect_filled(bar_rect, 4.0, tc.bg_elevated);
+                    let filled_rect = egui::Rect::from_min_size(
+                        bar_rect.left_top(),
+                        egui::Vec2::new(bar_width * used_frac, bar_height),
+                    );
+                    painter.rect_filled(filled_rect, 4.0, bar_color);
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} free / {}  ({:.0}% used)",
+                            free_str, total_str, used_frac * 100.0
+                        ))
+                        .color(tc.text_sec)
+                        .size(11.0),
+                    );
+                }
+            }
+
+            // Model + serial on one line
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(&si.model)
+                        .color(tc.text)
+                        .size(12.0),
+                );
+                if !si.serial_number.is_empty() {
+                    ui.label(
+                        egui::RichText::new(format!("({})", si.serial_number))
+                            .color(tc.text_sec)
+                            .monospace()
+                            .size(11.0),
+                    );
+                }
+            });
+
+            if !is_connected {
+                ui.label(
+                    egui::RichText::new("OFFLINE -- showing last known info")
+                        .color(tc.orange)
+                        .italics()
+                        .size(10.0),
+                );
+            }
+
+            ui.add_space(2.0);
+            let sep_rect = ui.allocate_exact_size(
+                egui::Vec2::new(ui.available_width(), 1.0),
+                egui::Sense::hover(),
+            ).0;
+            ui.painter().rect_filled(sep_rect, 0.0, tc.border);
+            ui.add_space(2.0);
+        } else {
+            // Non-storage device: just show name as header
+            ui.label(
+                egui::RichText::new(device_name)
+                    .strong()
+                    .size(14.0)
+                    .color(tc.text),
+            );
+        }
 
         // ── Nickname editing ──
         ui.horizontal(|ui| {
@@ -1100,108 +1198,10 @@ fn draw_device_detail_panel(
 
         ui.add_space(4.0);
 
-        // ── STORAGE section ──
+        // ── STORAGE technical details ──
         if let Some(si) = storage_info {
-            ui.label(
-                egui::RichText::new("STORAGE")
-                    .strong()
-                    .size(12.0)
-                    .color(tc.cyan),
-            );
-
-            if !is_connected {
-                ui.label(
-                    egui::RichText::new("(Offline — showing last known info)")
-                        .color(tc.text_muted)
-                        .italics()
-                        .size(10.0),
-                );
-            }
-
-            for vol in &si.volumes {
-                ui.add_space(2.0);
-                ui.horizontal(|ui| {
-                    // Drive letter badge
-                    ui.label(
-                        egui::RichText::new(&vol.drive_letter)
-                            .color(tc.green)
-                            .strong()
-                            .monospace()
-                            .size(13.0),
-                    );
-                    if !vol.volume_name.is_empty() {
-                        ui.label(
-                            egui::RichText::new(format!("\"{}\"", vol.volume_name))
-                                .color(tc.text)
-                                .size(12.0),
-                        );
-                    }
-                    ui.label(
-                        egui::RichText::new(format!("({})", vol.file_system))
-                            .color(tc.text_sec)
-                            .size(11.0),
-                    );
-                    let free_str = format_bytes(vol.free_bytes);
-                    let total_str = format_bytes(vol.total_bytes);
-                    ui.label(
-                        egui::RichText::new(format!("{} free / {}", free_str, total_str))
-                            .color(tc.text_sec)
-                            .size(11.0),
-                    );
-                });
-
-                // Capacity bar
-                if vol.total_bytes > 0 {
-                    let used_frac =
-                        1.0 - (vol.free_bytes as f32 / vol.total_bytes as f32);
-                    let bar_color = if used_frac < 0.7 {
-                        tc.green
-                    } else if used_frac < 0.9 {
-                        tc.yellow
-                    } else {
-                        tc.red
-                    };
-                    let bar_width = (ui.available_width() - 80.0).max(100.0);
-                    let bar_height = 8.0;
-                    let (bar_rect, _) = ui.allocate_exact_size(
-                        egui::Vec2::new(bar_width, bar_height),
-                        egui::Sense::hover(),
-                    );
-                    let painter = ui.painter_at(bar_rect);
-                    // Background
-                    painter.rect_filled(bar_rect, 3.0, tc.bg_elevated);
-                    // Filled portion
-                    let filled_rect = egui::Rect::from_min_size(
-                        bar_rect.left_top(),
-                        egui::Vec2::new(bar_width * used_frac, bar_height),
-                    );
-                    painter.rect_filled(filled_rect, 3.0, bar_color);
-                    // Percentage label
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new(format!("{:.0}% used", used_frac * 100.0))
-                                .color(tc.text_muted)
-                                .size(10.0),
-                        );
-                    });
-                }
-            }
-
-            if si.volumes.is_empty() {
-                ui.label(
-                    egui::RichText::new("No volumes detected")
-                        .color(tc.text_muted)
-                        .italics()
-                        .size(11.0),
-                );
-            }
-
-            ui.add_space(2.0);
-
-            // Drive details grid
+            // Compact detail row: interface, firmware, partitions, status
             let detail_rows = [
-                ("Model:", si.model.as_str()),
-                ("Serial:", si.serial_number.as_str()),
                 ("Interface:", si.interface_type.as_str()),
                 ("Firmware:", si.firmware.as_str()),
                 ("Status:", si.status.as_str()),
@@ -1222,21 +1222,6 @@ fn draw_device_detail_panel(
                         );
                     });
                 }
-            }
-            if si.partition_count > 0 {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("Partitions:")
-                            .color(tc.text_sec)
-                            .size(11.0),
-                    );
-                    ui.label(
-                        egui::RichText::new(format!("{}", si.partition_count))
-                            .color(tc.text)
-                            .monospace()
-                            .size(11.0),
-                    );
-                });
             }
 
             ui.add_space(4.0);
@@ -2161,22 +2146,51 @@ impl eframe::App for DeviceHistoryApp {
                                                     ui.horizontal(|ui| {
                                                         ui.spacing_mut().item_spacing.x = 6.0;
 
-                                                        ui.label(
-                                                            egui::RichText::new(dev.class())
-                                                                .color(tc.accent)
-                                                                .monospace()
-                                                                .size(11.0),
-                                                        );
-                                                        ui.add(
-                                                            egui::Label::new(
-                                                                egui::RichText::new(
-                                                                    dev.display_name(),
+                                                        // Drive info FIRST if storage device
+                                                        let conn_si = storage_info.get(dev_id);
+                                                        if let Some(si) = conn_si {
+                                                            for vol in &si.volumes {
+                                                                ui.label(
+                                                                    egui::RichText::new(&vol.drive_letter)
+                                                                        .color(tc.green)
+                                                                        .strong()
+                                                                        .monospace()
+                                                                        .size(13.0),
+                                                                );
+                                                                if !vol.volume_name.is_empty() {
+                                                                    ui.label(
+                                                                        egui::RichText::new(format!("\"{}\"", vol.volume_name))
+                                                                            .color(tc.text)
+                                                                            .strong()
+                                                                            .size(12.0),
+                                                                    );
+                                                                }
+                                                            }
+                                                            if !si.model.is_empty() {
+                                                                ui.label(
+                                                                    egui::RichText::new(&si.model)
+                                                                        .color(tc.text_sec)
+                                                                        .size(11.0),
+                                                                );
+                                                            }
+                                                        } else {
+                                                            ui.label(
+                                                                egui::RichText::new(dev.class())
+                                                                    .color(tc.accent)
+                                                                    .monospace()
+                                                                    .size(11.0),
+                                                            );
+                                                            ui.add(
+                                                                egui::Label::new(
+                                                                    egui::RichText::new(
+                                                                        dev.display_name(),
+                                                                    )
+                                                                    .color(tc.text)
+                                                                    .size(12.0),
                                                                 )
-                                                                .color(tc.text)
-                                                                .size(12.0),
-                                                            )
-                                                            .truncate(),
-                                                        );
+                                                                .truncate(),
+                                                            );
+                                                        }
                                                         // Nickname in teal
                                                         if let Some(kd) = known_devices.devices.get(dev_id) {
                                                             if let Some(nick) = &kd.nickname {
@@ -2200,27 +2214,17 @@ impl eframe::App for DeviceHistoryApp {
                                                                 .size(10.0),
                                                             );
                                                         }
-                                                        // Drive letter badge
-                                                        if let Some(si) = storage_info.get(dev_id) {
-                                                            for vol in &si.volumes {
-                                                                ui.label(
-                                                                    egui::RichText::new(format!("[{}]", vol.drive_letter))
-                                                                        .color(tc.green)
-                                                                        .strong()
-                                                                        .monospace()
-                                                                        .size(10.0),
+                                                        if conn_si.is_none() {
+                                                            if let Some(mfr) = &dev.Manufacturer {
+                                                                ui.add(
+                                                                    egui::Label::new(
+                                                                        egui::RichText::new(mfr)
+                                                                            .color(tc.text_sec)
+                                                                            .size(10.0),
+                                                                    )
+                                                                    .truncate(),
                                                                 );
                                                             }
-                                                        }
-                                                        if let Some(mfr) = &dev.Manufacturer {
-                                                            ui.add(
-                                                                egui::Label::new(
-                                                                    egui::RichText::new(mfr)
-                                                                        .color(tc.text_sec)
-                                                                        .size(10.0),
-                                                                )
-                                                                .truncate(),
-                                                            );
                                                         }
                                                     });
                                                 });
@@ -2457,20 +2461,51 @@ impl eframe::App for DeviceHistoryApp {
                                                                     .color(dot_color)
                                                                     .size(10.0),
                                                             );
-                                                            ui.label(
-                                                                egui::RichText::new(&dev.class)
-                                                                    .color(tc.accent)
-                                                                    .monospace()
-                                                                    .size(11.0),
-                                                            );
-                                                            ui.add(
-                                                                egui::Label::new(
-                                                                    egui::RichText::new(&dev.name)
-                                                                        .color(tc.text)
-                                                                        .size(12.0),
-                                                                )
-                                                                .truncate(),
-                                                            );
+                                                            // Drive letter + volume name FIRST if storage device
+                                                            let dev_si = storage_info.get(&dev.device_id)
+                                                                .or(dev.storage_info.as_ref());
+                                                            if let Some(si) = dev_si {
+                                                                for vol in &si.volumes {
+                                                                    ui.label(
+                                                                        egui::RichText::new(&vol.drive_letter)
+                                                                            .color(tc.green)
+                                                                            .strong()
+                                                                            .monospace()
+                                                                            .size(13.0),
+                                                                    );
+                                                                    if !vol.volume_name.is_empty() {
+                                                                        ui.label(
+                                                                            egui::RichText::new(format!("\"{}\"", vol.volume_name))
+                                                                                .color(tc.text)
+                                                                                .strong()
+                                                                                .size(12.0),
+                                                                        );
+                                                                    }
+                                                                }
+                                                                if !si.model.is_empty() {
+                                                                    ui.label(
+                                                                        egui::RichText::new(&si.model)
+                                                                            .color(tc.text_sec)
+                                                                            .size(11.0),
+                                                                    );
+                                                                }
+                                                            } else {
+                                                                // Non-storage: show class + name as before
+                                                                ui.label(
+                                                                    egui::RichText::new(&dev.class)
+                                                                        .color(tc.accent)
+                                                                        .monospace()
+                                                                        .size(11.0),
+                                                                );
+                                                                ui.add(
+                                                                    egui::Label::new(
+                                                                        egui::RichText::new(&dev.name)
+                                                                            .color(tc.text)
+                                                                            .size(12.0),
+                                                                    )
+                                                                    .truncate(),
+                                                                );
+                                                            }
                                                             // Nickname in teal
                                                             if let Some(nick) = &dev.nickname {
                                                                 if !nick.is_empty() {
@@ -2492,21 +2527,7 @@ impl eframe::App for DeviceHistoryApp {
                                                                     .size(10.0),
                                                                 );
                                                             }
-                                                            // Drive letter badge from live or cached storage info
-                                                            let dev_si = storage_info.get(&dev.device_id)
-                                                                .or(dev.storage_info.as_ref());
-                                                            if let Some(si) = dev_si {
-                                                                for vol in &si.volumes {
-                                                                    ui.label(
-                                                                        egui::RichText::new(format!("[{}]", vol.drive_letter))
-                                                                            .color(tc.green)
-                                                                            .strong()
-                                                                            .monospace()
-                                                                            .size(10.0),
-                                                                    );
-                                                                }
-                                                            }
-                                                            if !dev.manufacturer.is_empty() {
+                                                            if dev_si.is_none() && !dev.manufacturer.is_empty() {
                                                                 ui.add(
                                                                     egui::Label::new(
                                                                         egui::RichText::new(
