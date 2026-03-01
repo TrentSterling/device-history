@@ -3,8 +3,14 @@
   import EventCard from './EventCard.svelte';
 </script>
 
-<div class="event-log glass-panel">
-  {#if app.events.length === 0}
+<div class="event-log glass-panel scroll-shadow">
+  {#if app.isLoading}
+    <div style="display: flex; flex-direction: column; gap: 6px; padding: 8px;">
+      <div class="skeleton-card"></div>
+      <div class="skeleton-card"></div>
+      <div class="skeleton-card"></div>
+    </div>
+  {:else if app.filteredEvents.length === 0}
     <div class="empty">
       <span class="empty-icon">👀</span>
       <span class="empty-text">No events yet — waiting for USB changes...</span>
@@ -12,7 +18,7 @@
     </div>
   {:else}
     <div class="event-list">
-      {#each app.events as event, i (event.timestamp + event.device_id + i)}
+      {#each app.filteredEvents as event, i (event.timestamp + event.device_id + i)}
         <EventCard {event} />
       {/each}
     </div>

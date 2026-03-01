@@ -3,8 +3,13 @@
   import ConnectedDeviceCard from './ConnectedDeviceCard.svelte';
 </script>
 
-<div class="connected-devices glass-panel">
-  {#if app.devices.length === 0}
+<div class="connected-devices glass-panel scroll-shadow">
+  {#if app.isLoading}
+    <div style="display: flex; flex-direction: column; gap: 6px; padding: 8px;">
+      <div class="skeleton-card"></div>
+      <div class="skeleton-card"></div>
+    </div>
+  {:else if app.devices.length === 0}
     <div class="empty">
       <span class="empty-icon">🔍</span>
       <span>No devices connected</span>

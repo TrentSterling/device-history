@@ -3,6 +3,7 @@
   import SearchBar from './SearchBar.svelte';
   import SortControls from './SortControls.svelte';
   import KnownDeviceCard from './KnownDeviceCard.svelte';
+  import ClassFilter from '../shared/ClassFilter.svelte';
 </script>
 
 <div class="known-tab">
@@ -10,9 +11,16 @@
     <SearchBar />
     <SortControls />
   </div>
+  <ClassFilter />
 
-  <div class="device-list-container glass-panel">
-    {#if Object.keys(app.knownDevices).length === 0}
+  <div class="device-list-container glass-panel scroll-shadow">
+    {#if app.isLoading}
+      <div style="display: flex; flex-direction: column; gap: 6px; padding: 8px;">
+        <div class="skeleton-card"></div>
+        <div class="skeleton-card"></div>
+        <div class="skeleton-card"></div>
+      </div>
+    {:else if Object.keys(app.knownDevices).length === 0}
       <div class="empty">
         <span class="empty-icon">🔌</span>
         <span>No devices seen yet — plug in a USB device to get started</span>

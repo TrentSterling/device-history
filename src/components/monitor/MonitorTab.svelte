@@ -3,13 +3,16 @@
   import AboutBanner from './AboutBanner.svelte';
   import EventLog from './EventLog.svelte';
   import ConnectedDevices from './ConnectedDevices.svelte';
+  import ClassFilter from '../shared/ClassFilter.svelte';
 </script>
 
 <div class="monitor-tab">
   <AboutBanner />
 
+  <ClassFilter />
+
   <div class="section-header">
-    <span class="section-title">📜 Event Log ({app.events.length})</span>
+    <span class="section-title">📜 Event Log ({app.filteredEvents.length})</span>
     <button class="clear-btn" onclick={() => app.clearEvents()}>
       🗑️ Clear
     </button>
