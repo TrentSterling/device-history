@@ -219,9 +219,9 @@ button {
   pointer-events: none;
 }
 .card:hover {
-  border-color: color-mix(in srgb, var(--border) 40%, var(--accent));
-  box-shadow: 0 2px 12px var(--accent-glow), 0 0 1px var(--accent);
-  transform: translateY(-1px);
+  border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+  transform: perspective(800px) rotateX(1deg) translateY(-1px);
+  box-shadow: 0 4px 16px var(--shadow-color);
 }
 .card:hover::before {
   opacity: 1;
@@ -326,6 +326,31 @@ button {
   0%, 100% { transform: translateY(0); }
   50% { transform: translateY(-2px); }
 }
+@keyframes slideUpIn {
+  from { opacity: 0; transform: translateY(12px) scale(0.97); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+@keyframes crossfadeIn {
+  from { opacity: 0; transform: translateX(8px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+@keyframes crossfadeInReverse {
+  from { opacity: 0; transform: translateX(-8px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+@keyframes ripple {
+  from { transform: scale(0); opacity: 0.4; }
+  to { transform: scale(4); opacity: 0; }
+}
+@keyframes accentFlash {
+  0% { box-shadow: 0 0 0 0 var(--accent-glow-strong); }
+  50% { box-shadow: 0 0 16px 4px var(--accent-glow-strong); }
+  100% { box-shadow: 0 0 0 0 var(--accent-glow-strong); }
+}
+@keyframes skeletonPulse {
+  from { background-position: -200% 0; }
+  to { background-position: 200% 0; }
+}
 
 .anim-slide-in {
   animation: slideInLeft 350ms cubic-bezier(0.34, 1.56, 0.64, 1);
@@ -337,6 +362,35 @@ button {
   animation: slideUp 300ms ease-out;
 }
 
+/* ── Micro-interaction utilities ─────────────────────────── */
+.scroll-shadow {
+  mask-image: linear-gradient(to bottom, transparent, black 12px, black calc(100% - 12px), transparent);
+  -webkit-mask-image: linear-gradient(to bottom, transparent, black 12px, black calc(100% - 12px), transparent);
+}
+.skeleton-card {
+  height: 72px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: linear-gradient(90deg, var(--bg-elevated) 25%, var(--bg-surface) 50%, var(--bg-elevated) 75%);
+  background-size: 400% 100%;
+  animation: skeletonPulse 1.8s ease-in-out infinite;
+}
+.magnetic-hover {
+  transition: transform 180ms ease;
+}
+.magnetic-hover:hover {
+  transform: perspective(800px) rotateX(2deg) rotateY(-1deg) translateY(-2px);
+}
+.stagger-enter {
+  animation: slideUpIn 350ms cubic-bezier(0.34, 1.56, 0.64, 1) both;
+}
+.stagger-enter:nth-child(1) { animation-delay: 0ms; }
+.stagger-enter:nth-child(2) { animation-delay: 40ms; }
+.stagger-enter:nth-child(3) { animation-delay: 80ms; }
+.stagger-enter:nth-child(4) { animation-delay: 120ms; }
+.stagger-enter:nth-child(5) { animation-delay: 160ms; }
+.stagger-enter:nth-child(n+6) { animation-delay: 200ms; }
+
 /* ── Status dot ───────────────────────────────────────────── */
 .status-dot {
   display: inline-block;
@@ -347,12 +401,12 @@ button {
 }
 .status-dot.online {
   background: var(--green);
-  box-shadow: 0 0 6px var(--green), 0 0 12px color-mix(in srgb, var(--green) 40%, transparent);
+  box-shadow: 0 0 6px 2px var(--green);
   animation: glow-pulse 2s ease-in-out infinite;
 }
 .status-dot.offline {
   background: var(--text-muted);
-  opacity: 0.6;
+  opacity: 0.3;
 }
 
 /* ── Rainbow separator ────────────────────────────────────── */
