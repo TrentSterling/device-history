@@ -1,5 +1,6 @@
 import { listen } from "@tauri-apps/api/event";
 import * as cmd from "../commands";
+import { deviceClassCategory, type DeviceClassFilter } from "../utils";
 import type {
   AppSnapshot,
   DeviceEvent,
@@ -21,6 +22,9 @@ class AppState {
   // UI state
   theme = $state("neon");
   activeTab = $state<"monitor" | "known">("monitor");
+  classFilter = $state<DeviceClassFilter>("All");
+  soundEnabled = $state(false);
+  isLoading = $state(true);
   searchQuery = $state("");
   sortMode = $state<SortMode>("status");
   sortAscending = $state(true);
@@ -33,6 +37,12 @@ class AppState {
   // Notifications
   notifications = $state<{ id: number; text: string; kind: string }[]>([]);
   private nextNotifId = 0;
+
+  // Derived: filtered events by class
+  get filteredEvents(): DeviceEvent[] {
+    if (this.classFilter === "All") return this.events;
+    return this.events.filter(e => deviceClassCategory(e.class) === this.classFilter);
+  }
 
   // Derived: filtered + sorted known devices
   get filteredKnown(): KnownDevice[] {
@@ -49,6 +59,10 @@ class AppState {
           d.vid_pid.toLowerCase().includes(q) ||
           (d.nickname ?? "").toLowerCase().includes(q)
       );
+    }
+
+    if (this.classFilter !== "All") {
+      list = list.filter(d => deviceClassCategory(d.class) === this.classFilter);
     }
 
     const mode = this.sortMode;
@@ -98,6 +112,8 @@ class AppState {
       console.error("Failed to get initial snapshot:", e);
     }
 
+    this.isLoading = false;
+
     // Load prefs
     try {
       const prefs = await cmd.getPrefs();
@@ -117,7 +133,16 @@ class AppState {
 
     // Listen for real-time updates from monitor thread
     listen<AppSnapshot>("device-update", (event) => {
+      const prevCount = this.events.length;
       this.applySnapshot(event.payload);
+
+      // Show toast for new connect/disconnect events
+      const newEvents = this.events.slice(prevCount);
+      for (const evt of newEvents.slice(-3)) {
+        const icon = evt.kind === "connect" ? "\u{1F50C}" : "\u23CF\uFE0F";
+        const verb = evt.kind === "connect" ? "Connected" : "Disconnected";
+        this.notify(`${icon} ${verb}: ${evt.name || "USB Device"}`, evt.kind === "connect" ? "success" : "error");
+      }
     });
   }
 
@@ -185,6 +210,30 @@ class AppState {
       this.sortMode = mode;
       this.sortAscending = true;
     }
+  }
+
+  setClassFilter(filter: DeviceClassFilter) {
+    this.classFilter = filter;
+  }
+
+  toggleSound() {
+    this.soundEnabled = !this.soundEnabled;
+  }
+
+  exportEventsCSV() {
+    const header = "Timestamp,Event,Name,VID:PID,Class,Manufacturer,DeviceID";
+    const rows = this.events.map(e =>
+      `"${e.timestamp}","${e.kind}","${e.name || ""}","${e.vid_pid || ""}","${e.class || ""}","${e.manufacturer || ""}","${e.device_id}"`
+    );
+    const csv = [header, ...rows].join("\n");
+    const blob = new Blob([csv], { type: "text/csv" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `device-history-${new Date().toISOString().slice(0, 10)}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+    this.notify("Events exported to CSV", "success");
   }
 
   notify(text: string, kind: string = "info") {
