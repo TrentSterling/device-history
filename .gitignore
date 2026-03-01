@@ -1,3 +1,10 @@
 /target
 *.log
 Cargo.lock
+
+# App data
+*-cache.json
+*.prefs
+
+# Claude
+.claude/
