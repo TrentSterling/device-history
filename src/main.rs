@@ -2364,9 +2364,12 @@ impl eframe::App for DeviceHistoryApp {
                                 SortMode::Name => {
                                     a.name.to_lowercase().cmp(&b.name.to_lowercase())
                                 }
-                                SortMode::LastSeen => a.last_seen.cmp(&b.last_seen),
-                                SortMode::TimesSeen => a.times_seen.cmp(&b.times_seen),
-                                SortMode::FirstSeen => a.first_seen.cmp(&b.first_seen),
+                                SortMode::LastSeen => a.last_seen.cmp(&b.last_seen)
+                                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+                                SortMode::TimesSeen => a.times_seen.cmp(&b.times_seen)
+                                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+                                SortMode::FirstSeen => a.first_seen.cmp(&b.first_seen)
+                                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
                             };
                             if sort_ascending {
                                 cmp
