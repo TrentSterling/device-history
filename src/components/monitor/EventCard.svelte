@@ -8,37 +8,44 @@
   let isSelected = $derived(app.selectedDevice === event.device_id);
   let isConnect = $derived(event.kind === 'connect');
   let si = $derived(app.storageInfo[event.device_id] ?? null);
-
-  function toggle() {
-    app.selectDevice(isSelected ? null : event.device_id);
-  }
 </script>
 
 <div class="event-wrapper anim-slide-in">
   <button
-    class="card event-card"
+    class="card event-card magnetic-hover"
     class:selected={isSelected}
     class:connect-card={isConnect}
     class:disconnect-card={!isConnect}
-    onclick={toggle}
+    onclick={() => app.selectDevice(isSelected ? null : event.device_id)}
   >
-    <span class="time">{event.timestamp}</span>
-    <span class="kind-badge" class:connect={isConnect} class:disconnect={!isConnect}>
-      {isConnect ? '🔌 CONNECT' : '⛔ DISCONNECT'}
-    </span>
-    <span class="name">{event.name}</span>
-    {#if event.vid_pid}
-      <span class="vid-pid">🏷️ {event.vid_pid}</span>
-    {/if}
-    {#if si}
-      {#each si.volumes as vol}
-        <span class="drive">💿 {vol.drive_letter}</span>
-      {/each}
-    {/if}
-    <span class="class-badge">{event.class}</span>
-    {#if event.manufacturer}
-      <span class="mfr">🏭 {event.manufacturer}</span>
-    {/if}
+    <!-- Row 1: Badge + Timestamp -->
+    <div class="card-row">
+      <span class="event-badge" class:connect={isConnect} class:disconnect={!isConnect}>
+        {isConnect ? '\u25B2 CONNECT' : '\u25BC DISCONNECT'}
+      </span>
+      <span class="event-time">{event.timestamp}</span>
+    </div>
+
+    <!-- Row 2: Device name + Drive pills -->
+    <div class="card-row">
+      <span class="device-name">{event.name}</span>
+      {#if si}
+        <span class="drive-pills">
+          {#each si.volumes as vol}
+            <span class="drive-pill">{vol.drive_letter}</span>
+          {/each}
+        </span>
+      {/if}
+    </div>
+
+    <!-- Row 3: VID:PID + Class -->
+    <div class="meta-secondary">
+      {#if event.vid_pid}
+        <span>{event.vid_pid}</span>
+        <span class="meta-dot">&middot;</span>
+      {/if}
+      <span>{event.class}</span>
+    </div>
   </button>
   {#if isSelected}
     <DetailPanel deviceId={event.device_id} isConnected={isConnect} />
@@ -53,10 +60,11 @@
   }
   .event-card {
     display: flex;
-    align-items: center;
-    gap: 8px;
+    flex-direction: column;
+    gap: 4px;
     width: 100%;
     text-align: left;
+    padding: 12px 16px;
   }
   .connect-card {
     border-left: 3px solid var(--green);
@@ -64,49 +72,61 @@
   .disconnect-card {
     border-left: 3px solid var(--red);
   }
-  .time {
-    font-size: 11px;
-    color: var(--text-muted);
-    font-family: 'Cascadia Code', 'Consolas', monospace;
+  .card-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
   }
-  .kind-badge {
+  .event-badge {
     font-size: 11px;
     font-weight: 700;
-    padding: 1px 6px;
+    padding: 2px 8px;
     border-radius: 4px;
     white-space: nowrap;
   }
-  .kind-badge.connect {
+  .event-badge.connect {
     color: var(--green);
     background: color-mix(in srgb, var(--green) 12%, transparent);
   }
-  .kind-badge.disconnect {
+  .event-badge.disconnect {
     color: var(--red);
     background: color-mix(in srgb, var(--red) 12%, transparent);
   }
-  .name {
-    font-size: 12px;
-    color: var(--text);
-    font-weight: 500;
-  }
-  .vid-pid {
-    font-size: 10px;
-    color: var(--yellow);
-  }
-  .drive {
+  .event-time {
+    font-family: "Cascadia Code", "Consolas", monospace;
     font-size: 11px;
+    color: var(--text-muted);
+  }
+  .device-name {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text);
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .drive-pills {
+    display: flex;
+    gap: 4px;
+    flex-shrink: 0;
+    margin-left: 8px;
+  }
+  .drive-pill {
+    font-size: 11px;
+    font-weight: 600;
     color: var(--green);
-    font-weight: 500;
+    background: color-mix(in srgb, var(--green) 10%, transparent);
+    padding: 1px 6px;
+    border-radius: 4px;
   }
-  .class-badge {
-    font-size: 10px;
-    color: var(--accent);
-    padding: 1px 5px;
-    border-radius: 3px;
-    background: var(--accent-glow);
+  .meta-secondary {
+    font-size: 11px;
+    color: var(--text-muted);
+    margin-top: 3px;
   }
-  .mfr {
-    font-size: 10px;
-    color: var(--text-sec);
+  .meta-dot {
+    margin: 0 4px;
+    opacity: 0.4;
   }
 </style>
