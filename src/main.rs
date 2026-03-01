@@ -9,7 +9,7 @@ use std::fs::OpenOptions;
 use std::io::Write as IoWrite;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tray_icon::{TrayIconBuilder, TrayIconEvent};
 use wmi::{COMLibrary, WMIConnection};
@@ -120,6 +120,281 @@ fn query_devices(wmi: &WMIConnection) -> Option<HashMap<String, UsbDevice>> {
     )
 }
 
+// ── WMI Storage Queries ──────────────────────────────────────────
+
+#[derive(Deserialize, Debug, Clone)]
+#[allow(non_snake_case)]
+struct WmiDiskDrive {
+    DeviceID: Option<String>,
+    PNPDeviceID: Option<String>,
+    Model: Option<String>,
+    SerialNumber: Option<String>,
+    Size: Option<u64>,
+    InterfaceType: Option<String>,
+    MediaType: Option<String>,
+    Partitions: Option<u32>,
+    FirmwareRevision: Option<String>,
+    Status: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct StorageInfo {
+    model: String,
+    serial_number: String,
+    total_bytes: u64,
+    interface_type: String,
+    media_type: String,
+    firmware: String,
+    partition_count: u32,
+    status: String,
+    volumes: Vec<VolumeInfo>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct VolumeInfo {
+    drive_letter: String,
+    volume_name: String,
+    total_bytes: u64,
+    free_bytes: u64,
+    file_system: String,
+    volume_serial: String,
+}
+
+fn is_storage_device(dev: &UsbDevice) -> bool {
+    let class = dev.PNPClass.as_deref().unwrap_or("");
+    let name = dev.Name.as_deref().unwrap_or("");
+    class.contains("SCSIAdapter")
+        || class.contains("DiskDrive")
+        || (class.contains("USB") && name.contains("Storage"))
+        || name.contains("Mass Storage")
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    const GB: u64 = 1024 * MB;
+    const TB: u64 = 1024 * GB;
+    if bytes >= TB {
+        format!("{:.2} TB", bytes as f64 / TB as f64)
+    } else if bytes >= GB {
+        format!("{:.2} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.0} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+fn query_volumes_for_drive(drive: &WmiDiskDrive) -> Vec<VolumeInfo> {
+    let device_id = match drive.DeviceID.as_deref() {
+        Some(id) => id,
+        None => return vec![],
+    };
+
+    // Extract disk index from DeviceID like \\.\PHYSICALDRIVE2
+    let disk_index = match device_id
+        .to_uppercase()
+        .rsplit("PHYSICALDRIVE")
+        .next()
+        .and_then(|s| s.parse::<u32>().ok())
+    {
+        Some(idx) => idx,
+        None => {
+            log_to_file(&format!(
+                "ENRICH: can't extract disk index from {}",
+                device_id
+            ));
+            return vec![];
+        }
+    };
+
+    // Use PowerShell Get-Partition + Get-Volume (reliable on Win10/11)
+    let ps_script = format!(
+        "$ErrorActionPreference='SilentlyContinue'; \
+         Get-Partition -DiskNumber {} | Where-Object {{ $_.DriveLetter }} | ForEach-Object {{ \
+           $v = $_ | Get-Volume; \
+           [PSCustomObject]@{{ \
+             DriveLetter=[string]$_.DriveLetter; \
+             Label=if($v.FileSystemLabel){{$v.FileSystemLabel}}else{{''}}; \
+             Size=if($v.Size){{$v.Size}}else{{0}}; \
+             FreeSpace=if($v.SizeRemaining){{$v.SizeRemaining}}else{{0}}; \
+             FileSystem=if($v.FileSystem){{$v.FileSystem}}else{{''}} \
+           }} \
+         }} | ConvertTo-Json -Compress",
+        disk_index
+    );
+
+    let output = match std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", &ps_script])
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => {
+            log_to_file(&format!("ENRICH: PowerShell failed: {}", e));
+            return vec![];
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() {
+        log_to_file(&format!(
+            "ENRICH: no volumes for disk index {}",
+            disk_index
+        ));
+        return vec![];
+    }
+
+    // PowerShell returns single object (not array) when only 1 result
+    #[derive(Deserialize)]
+    #[allow(non_snake_case)]
+    struct PsVolume {
+        DriveLetter: Option<String>,
+        Label: Option<String>,
+        Size: Option<u64>,
+        FreeSpace: Option<u64>,
+        FileSystem: Option<String>,
+    }
+
+    let ps_volumes: Vec<PsVolume> = match serde_json::from_str::<Vec<PsVolume>>(trimmed) {
+        Ok(v) => v,
+        Err(_) => match serde_json::from_str::<PsVolume>(trimmed) {
+            Ok(v) => vec![v],
+            Err(e) => {
+                log_to_file(&format!(
+                    "ENRICH: JSON parse failed: {} — raw: {}",
+                    e, trimmed
+                ));
+                return vec![];
+            }
+        },
+    };
+
+    log_to_file(&format!(
+        "ENRICH: disk index {} has {} volumes",
+        disk_index,
+        ps_volumes.len()
+    ));
+
+    ps_volumes
+        .into_iter()
+        .filter_map(|pv| {
+            let letter = pv.DriveLetter?;
+            if letter.is_empty() {
+                return None;
+            }
+            Some(VolumeInfo {
+                drive_letter: format!("{}:", letter),
+                volume_name: pv.Label.unwrap_or_default(),
+                total_bytes: pv.Size.unwrap_or(0),
+                free_bytes: pv.FreeSpace.unwrap_or(0),
+                file_system: pv.FileSystem.unwrap_or_default(),
+                volume_serial: String::new(),
+            })
+        })
+        .collect()
+}
+
+fn query_storage_info(wmi: &WMIConnection, device_id: &str) -> Option<StorageInfo> {
+    // Extract USB serial suffix from device_id: USB\VID_xxxx&PID_yyyy\<serial>
+    let usb_serial = device_id.rsplit('\\').next()?.to_uppercase();
+    if usb_serial.is_empty() {
+        return None;
+    }
+
+    // Query ALL disk drives — UAS drives show as InterfaceType=SCSI, not USB
+    let drives: Vec<WmiDiskDrive> = match wmi.raw_query(
+        "SELECT DeviceID, PNPDeviceID, Model, SerialNumber, Size, InterfaceType, \
+         MediaType, Partitions, FirmwareRevision, Status \
+         FROM Win32_DiskDrive",
+    ) {
+        Ok(d) => d,
+        Err(e) => {
+            log_to_file(&format!("ENRICH FAIL: WMI query error: {}", e));
+            return None;
+        }
+    };
+
+    log_to_file(&format!(
+        "ENRICH: usb_serial={}, found {} drives: [{}]",
+        usb_serial,
+        drives.len(),
+        drives
+            .iter()
+            .map(|d| format!(
+                "{}|{}|{}",
+                d.Model.as_deref().unwrap_or("?"),
+                d.SerialNumber.as_deref().unwrap_or("?").trim(),
+                d.InterfaceType.as_deref().unwrap_or("?")
+            ))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
+
+    if drives.is_empty() {
+        return None;
+    }
+
+    // Match strategy (in priority order):
+    // 1. DiskDrive serial is a substring of USB serial or vice versa
+    //    e.g. USB serial "MSFT30NA8PE7LY" contains drive serial "NA8PE7LY"
+    // 2. DiskDrive PNPDeviceID contains the USB serial suffix
+    //    e.g. USBSTOR\...\WXF2D92FUV2S&0 contains "WXF2D92FUV2S"
+    let matched = drives
+        .iter()
+        .find(|d| {
+            // Check serial number match
+            if let Some(serial) = &d.SerialNumber {
+                let s = serial.trim().replace(' ', "").to_uppercase();
+                if !s.is_empty() && (s.contains(&usb_serial) || usb_serial.contains(&s)) {
+                    return true;
+                }
+            }
+            // Check PNPDeviceID match (for USBSTOR drives)
+            if let Some(pnp) = &d.PNPDeviceID {
+                let p = pnp.to_uppercase();
+                if p.contains(&usb_serial) {
+                    return true;
+                }
+            }
+            false
+        });
+
+    if matched.is_none() {
+        log_to_file(&format!("ENRICH FAIL: no drive matched usb_serial={}", usb_serial));
+        return None;
+    }
+    let matched = matched?;
+
+    let volumes = query_volumes_for_drive(matched);
+    log_to_file(&format!(
+        "ENRICH: matched drive={} serial={} → {} volumes [{}]",
+        matched.Model.as_deref().unwrap_or("?"),
+        matched.SerialNumber.as_deref().unwrap_or("?").trim(),
+        volumes.len(),
+        volumes.iter().map(|v| v.drive_letter.as_str()).collect::<Vec<_>>().join(", ")
+    ));
+
+    Some(StorageInfo {
+        model: matched.Model.clone().unwrap_or_default(),
+        serial_number: matched
+            .SerialNumber
+            .clone()
+            .unwrap_or_default()
+            .trim()
+            .to_string(),
+        total_bytes: matched.Size.unwrap_or(0),
+        interface_type: matched.InterfaceType.clone().unwrap_or_default(),
+        media_type: matched.MediaType.clone().unwrap_or_default(),
+        firmware: matched.FirmwareRevision.clone().unwrap_or_default(),
+        partition_count: matched.Partitions.unwrap_or(0),
+        status: matched.Status.clone().unwrap_or_default(),
+        volumes,
+    })
+}
+
 // ── Known device cache ──────────────────────────────────────────
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -134,6 +409,10 @@ struct KnownDevice {
     last_seen: String,
     times_seen: u32,
     currently_connected: bool,
+    #[serde(default)]
+    nickname: Option<String>,
+    #[serde(default)]
+    storage_info: Option<StorageInfo>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -145,7 +424,7 @@ struct KnownDeviceCache {
 impl KnownDeviceCache {
     fn new() -> Self {
         Self {
-            version: 1,
+            version: 2,
             devices: HashMap::new(),
         }
     }
@@ -190,6 +469,7 @@ struct AppState {
     events: Vec<DeviceEvent>,
     error: Option<String>,
     known_devices: KnownDeviceCache,
+    storage_info: HashMap<String, StorageInfo>,
 }
 
 // ── Preferences ────────────────────────────────────────────────
@@ -302,6 +582,8 @@ fn monitor_loop(state: Arc<Mutex<AppState>>) {
                             last_seen: now.clone(),
                             times_seen: 1,
                             currently_connected: true,
+                            nickname: None,
+                            storage_info: None,
                         });
                 if !is_new {
                     entry.last_seen = now.clone();
@@ -327,10 +609,68 @@ fn monitor_loop(state: Arc<Mutex<AppState>>) {
         }
     }
 
+    // Initial enrichment for connected storage devices
+    for (id, dev) in &prev {
+        if is_storage_device(dev) {
+            if let Some(info) = query_storage_info(&wmi, id) {
+                log_to_file(&format!(
+                    "ENRICHED (startup): {} → {} [{}]",
+                    id,
+                    info.model,
+                    info.volumes
+                        .iter()
+                        .map(|v| v.drive_letter.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+                if let Ok(mut s) = state.lock() {
+                    s.storage_info.insert(id.clone(), info.clone());
+                    if let Some(kd) = s.known_devices.devices.get_mut(id) {
+                        kd.storage_info = Some(info);
+                    }
+                    save_cache(&s.known_devices);
+                }
+            }
+        }
+    }
+
     log_to_file(&format!("Started monitoring — {} devices", prev.len()));
+
+    let mut pending_enrichments: Vec<(String, Instant)> = Vec::new();
 
     loop {
         thread::sleep(Duration::from_millis(500));
+
+        // Process pending enrichments (2s delay for drives to mount)
+        let now_instant = Instant::now();
+        let ready: Vec<String> = pending_enrichments
+            .iter()
+            .filter(|(_, scheduled)| now_instant.duration_since(*scheduled) >= Duration::from_secs(2))
+            .map(|(id, _)| id.clone())
+            .collect();
+        pending_enrichments
+            .retain(|(_, scheduled)| now_instant.duration_since(*scheduled) < Duration::from_secs(2));
+        for enrich_id in ready {
+            if let Some(info) = query_storage_info(&wmi, &enrich_id) {
+                log_to_file(&format!(
+                    "ENRICHED: {} → {} [{}]",
+                    enrich_id,
+                    info.model,
+                    info.volumes
+                        .iter()
+                        .map(|v| v.drive_letter.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+                if let Ok(mut s) = state.lock() {
+                    s.storage_info.insert(enrich_id.clone(), info.clone());
+                    if let Some(kd) = s.known_devices.devices.get_mut(&enrich_id) {
+                        kd.storage_info = Some(info);
+                    }
+                    save_cache(&s.known_devices);
+                }
+            }
+        }
 
         let Some(current) = query_devices(&wmi) else {
             continue;
@@ -383,6 +723,17 @@ fn monitor_loop(state: Arc<Mutex<AppState>>) {
         }
 
         if !new_events.is_empty() {
+            // Collect IDs for enrichment/cleanup before consuming events
+            let enrich_ids: Vec<String> = new_events
+                .iter()
+                .filter(|e| e.kind == EventKind::Connect)
+                .filter(|e| {
+                    current
+                        .get(&e.device_id)
+                        .map_or(false, |d| is_storage_device(d))
+                })
+                .map(|e| e.device_id.clone())
+                .collect();
             if let Ok(mut s) = state.lock() {
                 // Update cache for each event
                 for event in &new_events {
@@ -406,6 +757,8 @@ fn monitor_loop(state: Arc<Mutex<AppState>>) {
                                         last_seen: now_iso.clone(),
                                         times_seen: 0,
                                         currently_connected: true,
+                                        nickname: None,
+                                        storage_info: None,
                                     });
                                 entry.times_seen += 1;
                                 entry.last_seen = now_iso.clone();
@@ -428,6 +781,8 @@ fn monitor_loop(state: Arc<Mutex<AppState>>) {
                                 entry.last_seen = now_iso.clone();
                                 entry.currently_connected = false;
                             }
+                            // Remove live storage info on disconnect
+                            s.storage_info.remove(&event.device_id);
                         }
                     }
                 }
@@ -443,6 +798,11 @@ fn monitor_loop(state: Arc<Mutex<AppState>>) {
                 s.devices = sorted;
 
                 save_cache(&s.known_devices);
+            }
+
+            // Schedule enrichment for connected storage devices (2s delay)
+            for id in enrich_ids {
+                pending_enrichments.push((id, Instant::now()));
             }
         }
 
@@ -493,7 +853,7 @@ impl Theme {
                 cyan: c(0x8b, 0xe9, 0xfd),
                 text: c(0xe8, 0xe8, 0xf0),
                 text_sec: c(0x8c, 0x8c, 0xa0),
-                text_muted: c(0x55, 0x57, 0x68),
+                text_muted: c(0x72, 0x74, 0x88),
                 dark_mode: true,
             },
             Theme::Light => ThemeColors {
@@ -664,6 +1024,376 @@ fn draw_rainbow_separator(ui: &mut egui::Ui, tc: &ThemeColors) {
     }
 }
 
+// ── Device Detail Panel ─────────────────────────────────────────
+
+#[allow(clippy::too_many_arguments)]
+fn draw_device_detail_panel(
+    ui: &mut egui::Ui,
+    tc: &ThemeColors,
+    device_id: &str,
+    device_name: &str,
+    vid_pid: Option<String>,
+    class: &str,
+    manufacturer: Option<&str>,
+    description: Option<&str>,
+    known_device: Option<&KnownDevice>,
+    storage_info: Option<&StorageInfo>,
+    nickname_buf: &mut String,
+    state_arc: &Arc<Mutex<AppState>>,
+    is_connected: bool,
+) {
+    let detail_frame = egui::Frame::none()
+        .fill(blend(tc.bg_surface, tc.accent, 0.03))
+        .rounding(egui::Rounding {
+            nw: 0.0,
+            ne: 0.0,
+            sw: 6.0,
+            se: 6.0,
+        })
+        .stroke(egui::Stroke::new(1.0, blend(tc.border, tc.accent, 0.3)))
+        .inner_margin(egui::Margin::same(12.0));
+
+    detail_frame.show(ui, |ui: &mut egui::Ui| {
+        ui.set_width(ui.available_width());
+        ui.spacing_mut().item_spacing.y = 4.0;
+
+        // ── Header: device name ──
+        ui.label(
+            egui::RichText::new(device_name)
+                .strong()
+                .size(14.0)
+                .color(tc.text),
+        );
+
+        // ── Nickname editing ──
+        ui.horizontal(|ui| {
+            ui.label(
+                egui::RichText::new("Nickname:")
+                    .color(tc.text_sec)
+                    .size(11.0),
+            );
+            let te = egui::TextEdit::singleline(nickname_buf)
+                .hint_text("e.g. My 4TB Seagate")
+                .desired_width(200.0)
+                .text_color(tc.text);
+            ui.add(te);
+            let save_btn = egui::Button::new(
+                egui::RichText::new("Save").color(tc.teal).size(11.0),
+            )
+            .fill(egui::Color32::TRANSPARENT)
+            .stroke(egui::Stroke::new(0.5, tc.teal))
+            .rounding(3.0);
+            if ui.add(save_btn).clicked() {
+                let nick = if nickname_buf.trim().is_empty() {
+                    None
+                } else {
+                    Some(nickname_buf.trim().to_string())
+                };
+                if let Ok(mut s) = state_arc.lock() {
+                    if let Some(kd) = s.known_devices.devices.get_mut(device_id) {
+                        kd.nickname = nick;
+                    }
+                    save_cache(&s.known_devices);
+                }
+            }
+        });
+
+        ui.add_space(4.0);
+
+        // ── STORAGE section ──
+        if let Some(si) = storage_info {
+            ui.label(
+                egui::RichText::new("STORAGE")
+                    .strong()
+                    .size(12.0)
+                    .color(tc.cyan),
+            );
+
+            if !is_connected {
+                ui.label(
+                    egui::RichText::new("(Offline — showing last known info)")
+                        .color(tc.text_muted)
+                        .italics()
+                        .size(10.0),
+                );
+            }
+
+            for vol in &si.volumes {
+                ui.add_space(2.0);
+                ui.horizontal(|ui| {
+                    // Drive letter badge
+                    ui.label(
+                        egui::RichText::new(&vol.drive_letter)
+                            .color(tc.green)
+                            .strong()
+                            .monospace()
+                            .size(13.0),
+                    );
+                    if !vol.volume_name.is_empty() {
+                        ui.label(
+                            egui::RichText::new(format!("\"{}\"", vol.volume_name))
+                                .color(tc.text)
+                                .size(12.0),
+                        );
+                    }
+                    ui.label(
+                        egui::RichText::new(format!("({})", vol.file_system))
+                            .color(tc.text_sec)
+                            .size(11.0),
+                    );
+                    let free_str = format_bytes(vol.free_bytes);
+                    let total_str = format_bytes(vol.total_bytes);
+                    ui.label(
+                        egui::RichText::new(format!("{} free / {}", free_str, total_str))
+                            .color(tc.text_sec)
+                            .size(11.0),
+                    );
+                });
+
+                // Capacity bar
+                if vol.total_bytes > 0 {
+                    let used_frac =
+                        1.0 - (vol.free_bytes as f32 / vol.total_bytes as f32);
+                    let bar_color = if used_frac < 0.7 {
+                        tc.green
+                    } else if used_frac < 0.9 {
+                        tc.yellow
+                    } else {
+                        tc.red
+                    };
+                    let bar_width = (ui.available_width() - 80.0).max(100.0);
+                    let bar_height = 8.0;
+                    let (bar_rect, _) = ui.allocate_exact_size(
+                        egui::Vec2::new(bar_width, bar_height),
+                        egui::Sense::hover(),
+                    );
+                    let painter = ui.painter_at(bar_rect);
+                    // Background
+                    painter.rect_filled(bar_rect, 3.0, tc.bg_elevated);
+                    // Filled portion
+                    let filled_rect = egui::Rect::from_min_size(
+                        bar_rect.left_top(),
+                        egui::Vec2::new(bar_width * used_frac, bar_height),
+                    );
+                    painter.rect_filled(filled_rect, 3.0, bar_color);
+                    // Percentage label
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!("{:.0}% used", used_frac * 100.0))
+                                .color(tc.text_muted)
+                                .size(10.0),
+                        );
+                    });
+                }
+            }
+
+            if si.volumes.is_empty() {
+                ui.label(
+                    egui::RichText::new("No volumes detected")
+                        .color(tc.text_muted)
+                        .italics()
+                        .size(11.0),
+                );
+            }
+
+            ui.add_space(2.0);
+
+            // Drive details grid
+            let detail_rows = [
+                ("Model:", si.model.as_str()),
+                ("Serial:", si.serial_number.as_str()),
+                ("Interface:", si.interface_type.as_str()),
+                ("Firmware:", si.firmware.as_str()),
+                ("Status:", si.status.as_str()),
+            ];
+            for (label, value) in &detail_rows {
+                if !value.is_empty() {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(*label)
+                                .color(tc.text_sec)
+                                .size(11.0),
+                        );
+                        ui.label(
+                            egui::RichText::new(*value)
+                                .color(tc.text)
+                                .monospace()
+                                .size(11.0),
+                        );
+                    });
+                }
+            }
+            if si.partition_count > 0 {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new("Partitions:")
+                            .color(tc.text_sec)
+                            .size(11.0),
+                    );
+                    ui.label(
+                        egui::RichText::new(format!("{}", si.partition_count))
+                            .color(tc.text)
+                            .monospace()
+                            .size(11.0),
+                    );
+                });
+            }
+
+            ui.add_space(4.0);
+            // Thin separator
+            let sep_rect = ui.allocate_exact_size(
+                egui::Vec2::new(ui.available_width(), 1.0),
+                egui::Sense::hover(),
+            ).0;
+            ui.painter().rect_filled(sep_rect, 0.0, tc.border);
+            ui.add_space(4.0);
+        }
+
+        // ── DEVICE INFO section ──
+        ui.label(
+            egui::RichText::new("DEVICE INFO")
+                .strong()
+                .size(12.0)
+                .color(tc.cyan),
+        );
+
+        let info_rows: Vec<(&str, String)> = vec![
+            ("Device ID:", device_id.to_string()),
+            (
+                "VID:PID:",
+                vid_pid.clone().unwrap_or_else(|| "-".to_string()),
+            ),
+            ("Class:", class.to_string()),
+            (
+                "Manufacturer:",
+                manufacturer.unwrap_or("-").to_string(),
+            ),
+            (
+                "Description:",
+                description.unwrap_or("-").to_string(),
+            ),
+        ];
+        for (label, value) in &info_rows {
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(*label)
+                        .color(tc.text_sec)
+                        .size(11.0),
+                );
+                ui.add(
+                    egui::Label::new(
+                        egui::RichText::new(value)
+                            .color(tc.text)
+                            .monospace()
+                            .size(11.0),
+                    )
+                    .truncate(),
+                );
+            });
+        }
+
+        // ── HISTORY section ──
+        if let Some(kd) = known_device {
+            ui.add_space(4.0);
+            let sep_rect = ui.allocate_exact_size(
+                egui::Vec2::new(ui.available_width(), 1.0),
+                egui::Sense::hover(),
+            ).0;
+            ui.painter().rect_filled(sep_rect, 0.0, tc.border);
+            ui.add_space(4.0);
+
+            ui.label(
+                egui::RichText::new("HISTORY")
+                    .strong()
+                    .size(12.0)
+                    .color(tc.cyan),
+            );
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 16.0;
+                ui.label(
+                    egui::RichText::new(format!("First seen: {}", kd.first_seen))
+                        .color(tc.text_sec)
+                        .size(11.0),
+                );
+                ui.label(
+                    egui::RichText::new(format!("Last seen: {}", kd.last_seen))
+                        .color(tc.text_sec)
+                        .size(11.0),
+                );
+                ui.label(
+                    egui::RichText::new(format!("Times seen: {}x", kd.times_seen))
+                        .color(tc.teal)
+                        .size(11.0),
+                );
+            });
+        }
+
+        // ── Action buttons ──
+        ui.add_space(6.0);
+        let sep_rect = ui.allocate_exact_size(
+            egui::Vec2::new(ui.available_width(), 1.0),
+            egui::Sense::hover(),
+        ).0;
+        ui.painter().rect_filled(sep_rect, 0.0, tc.border);
+        ui.add_space(4.0);
+
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+
+            // Copy Device ID
+            let copy_id_btn = egui::Button::new(
+                egui::RichText::new("Copy Device ID")
+                    .color(tc.text_sec)
+                    .size(11.0),
+            )
+            .fill(egui::Color32::TRANSPARENT)
+            .stroke(egui::Stroke::new(0.5, tc.border))
+            .rounding(3.0);
+            if ui.add(copy_id_btn).clicked() {
+                ui.output_mut(|o| {
+                    o.copied_text = device_id.to_string();
+                });
+            }
+
+            // Copy Serial (if storage info available)
+            if let Some(si) = storage_info {
+                if !si.serial_number.is_empty() {
+                    let copy_serial_btn = egui::Button::new(
+                        egui::RichText::new("Copy Serial")
+                            .color(tc.text_sec)
+                            .size(11.0),
+                    )
+                    .fill(egui::Color32::TRANSPARENT)
+                    .stroke(egui::Stroke::new(0.5, tc.border))
+                    .rounding(3.0);
+                    if ui.add(copy_serial_btn).clicked() {
+                        ui.output_mut(|o| {
+                            o.copied_text = si.serial_number.clone();
+                        });
+                    }
+                }
+            }
+
+            // Forget button
+            let forget_btn = egui::Button::new(
+                egui::RichText::new("Forget")
+                    .color(tc.red)
+                    .size(11.0),
+            )
+            .fill(egui::Color32::TRANSPARENT)
+            .stroke(egui::Stroke::new(0.5, tc.red))
+            .rounding(3.0);
+            if ui.add(forget_btn).clicked() {
+                if let Ok(mut s) = state_arc.lock() {
+                    s.known_devices.devices.remove(device_id);
+                    s.storage_info.remove(device_id);
+                    save_cache(&s.known_devices);
+                }
+            }
+        });
+    });
+}
+
 // ── Tab + Sort enums ───────────────────────────────────────────
 
 #[derive(Clone, Copy, PartialEq)]
@@ -737,6 +1467,8 @@ struct DeviceHistoryApp {
     search_query: String,
     sort_mode: SortMode,
     sort_ascending: bool,
+    selected_device: Option<String>,
+    nickname_buf: String,
 }
 
 impl DeviceHistoryApp {
@@ -791,6 +1523,8 @@ impl DeviceHistoryApp {
             search_query: String::new(),
             sort_mode: SortMode::Status,
             sort_ascending: true,
+            selected_device: None,
+            nickname_buf: String::new(),
         }
     }
 
@@ -825,13 +1559,14 @@ impl eframe::App for DeviceHistoryApp {
         let state_arc = self.state.clone();
 
         // ── Clone all data from state, drop lock ──
-        let (events, devices, known_devices, error) = {
+        let (events, devices, known_devices, error, storage_info) = {
             let s = self.state.lock().unwrap();
             (
                 s.events.clone(),
                 s.devices.clone(),
                 s.known_devices.clone(),
                 s.error.clone(),
+                s.storage_info.clone(),
             )
         };
 
@@ -1021,7 +1756,7 @@ impl eframe::App for DeviceHistoryApp {
                             .color(tc.text_muted)
                             .size(12.0),
                     );
-                    ui.label(egui::RichText::new("\u{2022}").color(tc.accent).size(10.0));
+                    ui.label(egui::RichText::new("|").color(tc.accent).size(10.0));
                     ui.label(
                         egui::RichText::new(format!(
                             "{} known ({} online)",
@@ -1030,7 +1765,7 @@ impl eframe::App for DeviceHistoryApp {
                         .color(tc.text_muted)
                         .size(12.0),
                     );
-                    ui.label(egui::RichText::new("\u{2022}").color(tc.accent).size(10.0));
+                    ui.label(egui::RichText::new("|").color(tc.accent).size(10.0));
                     ui.label(
                         egui::RichText::new("Log: device-history.log")
                             .color(tc.text_muted)
@@ -1051,6 +1786,8 @@ impl eframe::App for DeviceHistoryApp {
         let mut search_query = self.search_query.clone();
         let mut sort_mode = self.sort_mode;
         let mut sort_ascending = self.sort_ascending;
+        let mut selected_device = self.selected_device.clone();
+        let mut nickname_buf = self.nickname_buf.clone();
 
         egui::CentralPanel::default()
             .frame(
@@ -1122,7 +1859,7 @@ impl eframe::App for DeviceHistoryApp {
                                     for (color, title, desc) in &features {
                                         ui.horizontal(|ui| {
                                             ui.label(
-                                                egui::RichText::new("\u{2022}")
+                                                egui::RichText::new("|")
                                                     .color(*color)
                                                     .size(12.0),
                                             );
@@ -1210,7 +1947,7 @@ impl eframe::App for DeviceHistoryApp {
                                             ui.vertical_centered(|ui| {
                                                 ui.label(
                                                     egui::RichText::new(
-                                                        "No events yet \u{2014} waiting for USB changes...",
+                                                        "No events yet -- waiting for USB changes...",
                                                     )
                                                     .color(tc.text_sec)
                                                     .italics()
@@ -1218,23 +1955,32 @@ impl eframe::App for DeviceHistoryApp {
                                                 );
                                             });
                                         } else {
-                                            for event in &events {
+                                            for (ev_idx, event) in events.iter().enumerate() {
+                                                let is_selected = selected_device.as_deref() == Some(&event.device_id);
                                                 let (accent, icon, label) = match event.kind {
                                                     EventKind::Connect => {
-                                                        (tc.green, "\u{25B2}", "CONNECT")
+                                                        (tc.green, "^", "CONNECT")
                                                     }
                                                     EventKind::Disconnect => {
-                                                        (tc.red, "\u{25BC}", "DISCONNECT")
+                                                        (tc.red, "v", "DISCONNECT")
                                                     }
                                                 };
 
-                                                let card_fill =
-                                                    blend(tc.bg_elevated, accent, 0.05);
+                                                let card_fill = if is_selected {
+                                                    blend(tc.bg_elevated, tc.accent, 0.12)
+                                                } else {
+                                                    blend(tc.bg_elevated, accent, 0.05)
+                                                };
+                                                let card_stroke = if is_selected {
+                                                    egui::Stroke::new(1.5, tc.accent)
+                                                } else {
+                                                    egui::Stroke::new(0.5, tc.border)
+                                                };
 
-                                                egui::Frame::none()
+                                                let frame_resp = egui::Frame::none()
                                                     .fill(card_fill)
                                                     .rounding(4.0)
-                                                    .stroke(egui::Stroke::new(0.5, tc.border))
+                                                    .stroke(card_stroke)
                                                     .inner_margin(egui::Margin {
                                                         left: 10.0,
                                                         right: 8.0,
@@ -1304,6 +2050,18 @@ impl eframe::App for DeviceHistoryApp {
                                                                     .size(11.0),
                                                                 );
                                                             }
+                                                            // Drive letter badge
+                                                            if let Some(si) = storage_info.get(&event.device_id) {
+                                                                for vol in &si.volumes {
+                                                                    ui.label(
+                                                                        egui::RichText::new(format!("[{}]", vol.drive_letter))
+                                                                            .color(tc.green)
+                                                                            .strong()
+                                                                            .monospace()
+                                                                            .size(11.0),
+                                                                    );
+                                                                }
+                                                            }
                                                             ui.label(
                                                                 egui::RichText::new(&event.class)
                                                                     .color(tc.accent)
@@ -1325,6 +2083,23 @@ impl eframe::App for DeviceHistoryApp {
                                                             }
                                                         });
                                                     });
+
+                                                // Click interaction
+                                                let click_resp = ui.interact(
+                                                    frame_resp.response.rect,
+                                                    egui::Id::new("event_click").with(ev_idx),
+                                                    egui::Sense::click(),
+                                                );
+                                                if click_resp.clicked() {
+                                                    if is_selected {
+                                                        selected_device = None;
+                                                    } else {
+                                                        selected_device = Some(event.device_id.clone());
+                                                    }
+                                                }
+                                                if click_resp.hovered() {
+                                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                                }
                                             }
                                         }
                                     });
@@ -1363,11 +2138,23 @@ impl eframe::App for DeviceHistoryApp {
                                     .show(ui, |ui| {
                                         ui.spacing_mut().item_spacing.y = 2.0;
 
-                                        for (_id, dev) in &devices {
-                                            egui::Frame::none()
-                                                .fill(tc.bg_elevated)
+                                        for (dev_idx, (dev_id, dev)) in devices.iter().enumerate() {
+                                            let is_selected = selected_device.as_deref() == Some(dev_id.as_str());
+                                            let card_fill = if is_selected {
+                                                blend(tc.bg_elevated, tc.accent, 0.12)
+                                            } else {
+                                                tc.bg_elevated
+                                            };
+                                            let card_stroke = if is_selected {
+                                                egui::Stroke::new(1.5, tc.accent)
+                                            } else {
+                                                egui::Stroke::new(0.5, tc.border)
+                                            };
+
+                                            let frame_resp = egui::Frame::none()
+                                                .fill(card_fill)
                                                 .rounding(4.0)
-                                                .stroke(egui::Stroke::new(0.5, tc.border))
+                                                .stroke(card_stroke)
                                                 .inner_margin(egui::Margin::symmetric(10.0, 4.0))
                                                 .show(ui, |ui: &mut egui::Ui| {
                                                     ui.set_width(ui.available_width());
@@ -1390,6 +2177,18 @@ impl eframe::App for DeviceHistoryApp {
                                                             )
                                                             .truncate(),
                                                         );
+                                                        // Nickname in teal
+                                                        if let Some(kd) = known_devices.devices.get(dev_id) {
+                                                            if let Some(nick) = &kd.nickname {
+                                                                if !nick.is_empty() {
+                                                                    ui.label(
+                                                                        egui::RichText::new(format!("({})", nick))
+                                                                            .color(tc.teal)
+                                                                            .size(11.0),
+                                                                    );
+                                                                }
+                                                            }
+                                                        }
                                                         if let Some(vp) = dev.vid_pid() {
                                                             ui.label(
                                                                 egui::RichText::new(format!(
@@ -1400,6 +2199,18 @@ impl eframe::App for DeviceHistoryApp {
                                                                 .monospace()
                                                                 .size(10.0),
                                                             );
+                                                        }
+                                                        // Drive letter badge
+                                                        if let Some(si) = storage_info.get(dev_id) {
+                                                            for vol in &si.volumes {
+                                                                ui.label(
+                                                                    egui::RichText::new(format!("[{}]", vol.drive_letter))
+                                                                        .color(tc.green)
+                                                                        .strong()
+                                                                        .monospace()
+                                                                        .size(10.0),
+                                                                );
+                                                            }
                                                         }
                                                         if let Some(mfr) = &dev.Manufacturer {
                                                             ui.add(
@@ -1413,6 +2224,43 @@ impl eframe::App for DeviceHistoryApp {
                                                         }
                                                     });
                                                 });
+
+                                            // Click interaction
+                                            let click_resp = ui.interact(
+                                                frame_resp.response.rect,
+                                                egui::Id::new("connected_click").with(dev_idx),
+                                                egui::Sense::click(),
+                                            );
+                                            if click_resp.clicked() {
+                                                if is_selected {
+                                                    selected_device = None;
+                                                } else {
+                                                    selected_device = Some(dev_id.clone());
+                                                    if let Some(kd) = known_devices.devices.get(dev_id) {
+                                                        nickname_buf = kd.nickname.clone().unwrap_or_default();
+                                                    }
+                                                }
+                                            }
+                                            if click_resp.hovered() {
+                                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                            }
+
+                                            // Inline detail panel
+                                            if is_selected {
+                                                let dev_si = storage_info.get(dev_id)
+                                                    .or_else(|| known_devices.devices.get(dev_id).and_then(|kd| kd.storage_info.as_ref()));
+                                                let kd = known_devices.devices.get(dev_id);
+                                                draw_device_detail_panel(
+                                                    ui, &tc, dev_id, dev.display_name(),
+                                                    dev.vid_pid(), dev.class(),
+                                                    dev.Manufacturer.as_deref(),
+                                                    dev.Description.as_deref(),
+                                                    kd, dev_si,
+                                                    &mut nickname_buf,
+                                                    &state_arc,
+                                                    true, // is_connected
+                                                );
+                                            }
                                         }
                                     });
                             });
@@ -1422,7 +2270,7 @@ impl eframe::App for DeviceHistoryApp {
                         // ── Search bar ──
                         ui.horizontal(|ui| {
                             ui.label(
-                                egui::RichText::new("\u{1F50D}")
+                                egui::RichText::new("Search:")
                                     .size(14.0)
                                     .color(tc.text_sec),
                             );
@@ -1445,9 +2293,9 @@ impl eframe::App for DeviceHistoryApp {
                                 let selected = sort_mode == mode;
                                 let arrow = if selected {
                                     if sort_ascending {
-                                        " \u{25B2}"
+                                        " ^"
                                     } else {
-                                        " \u{25BC}"
+                                        " v"
                                     }
                                 } else {
                                     ""
@@ -1497,6 +2345,7 @@ impl eframe::App for DeviceHistoryApp {
                                     || d.class.to_lowercase().contains(&query_lower)
                                     || d.manufacturer.to_lowercase().contains(&query_lower)
                                     || d.vid_pid.to_lowercase().contains(&query_lower)
+                                    || d.nickname.as_deref().unwrap_or("").to_lowercase().contains(&query_lower)
                             })
                             .collect();
 
@@ -1542,7 +2391,7 @@ impl eframe::App for DeviceHistoryApp {
                                             ui.vertical_centered(|ui| {
                                                 ui.label(
                                                     egui::RichText::new(
-                                                        "No devices seen yet \u{2014} plug in a USB device to get started",
+                                                        "No devices seen yet -- plug in a USB device to get started",
                                                     )
                                                     .color(tc.text_sec)
                                                     .italics()
@@ -1563,19 +2412,27 @@ impl eframe::App for DeviceHistoryApp {
                                                 );
                                             });
                                         } else {
-                                            let mut forget_id: Option<String> = None;
+                                            let forget_id: Option<String> = None;
 
-                                            for dev in &filtered {
-                                                let card_fill = if dev.currently_connected {
+                                            for (kd_idx, dev) in filtered.iter().enumerate() {
+                                                let is_selected = selected_device.as_deref() == Some(&dev.device_id);
+                                                let card_fill = if is_selected {
+                                                    blend(tc.bg_elevated, tc.accent, 0.10)
+                                                } else if dev.currently_connected {
                                                     blend(tc.bg_elevated, tc.green, 0.06)
                                                 } else {
                                                     tc.bg_elevated
                                                 };
+                                                let card_stroke = if is_selected {
+                                                    egui::Stroke::new(1.5, tc.accent)
+                                                } else {
+                                                    egui::Stroke::new(0.5, tc.border)
+                                                };
 
-                                                let resp = egui::Frame::none()
+                                                let frame_resp = egui::Frame::none()
                                                     .fill(card_fill)
                                                     .rounding(4.0)
-                                                    .stroke(egui::Stroke::new(0.5, tc.border))
+                                                    .stroke(card_stroke)
                                                     .inner_margin(egui::Margin {
                                                         left: 10.0,
                                                         right: 8.0,
@@ -1585,11 +2442,10 @@ impl eframe::App for DeviceHistoryApp {
                                                     .show(ui, |ui: &mut egui::Ui| {
                                                         ui.set_width(ui.available_width());
 
-                                                        // Row 1: status dot, class, name, vid:pid, manufacturer
+                                                        // Row 1: status dot, class, name, nickname, vid:pid, drive letter, manufacturer
                                                         ui.horizontal(|ui| {
                                                             ui.spacing_mut().item_spacing.x = 6.0;
 
-                                                            // Status dot
                                                             let dot_color =
                                                                 if dev.currently_connected {
                                                                     tc.green
@@ -1597,20 +2453,16 @@ impl eframe::App for DeviceHistoryApp {
                                                                     tc.text_muted
                                                                 };
                                                             ui.label(
-                                                                egui::RichText::new("\u{25CF}")
+                                                                egui::RichText::new("*")
                                                                     .color(dot_color)
                                                                     .size(10.0),
                                                             );
-
-                                                            // Class badge
                                                             ui.label(
                                                                 egui::RichText::new(&dev.class)
                                                                     .color(tc.accent)
                                                                     .monospace()
                                                                     .size(11.0),
                                                             );
-
-                                                            // Device name
                                                             ui.add(
                                                                 egui::Label::new(
                                                                     egui::RichText::new(&dev.name)
@@ -1619,8 +2471,16 @@ impl eframe::App for DeviceHistoryApp {
                                                                 )
                                                                 .truncate(),
                                                             );
-
-                                                            // VID:PID
+                                                            // Nickname in teal
+                                                            if let Some(nick) = &dev.nickname {
+                                                                if !nick.is_empty() {
+                                                                    ui.label(
+                                                                        egui::RichText::new(format!("({})", nick))
+                                                                            .color(tc.teal)
+                                                                            .size(11.0),
+                                                                    );
+                                                                }
+                                                            }
                                                             if !dev.vid_pid.is_empty() {
                                                                 ui.label(
                                                                     egui::RichText::new(format!(
@@ -1632,8 +2492,20 @@ impl eframe::App for DeviceHistoryApp {
                                                                     .size(10.0),
                                                                 );
                                                             }
-
-                                                            // Manufacturer
+                                                            // Drive letter badge from live or cached storage info
+                                                            let dev_si = storage_info.get(&dev.device_id)
+                                                                .or(dev.storage_info.as_ref());
+                                                            if let Some(si) = dev_si {
+                                                                for vol in &si.volumes {
+                                                                    ui.label(
+                                                                        egui::RichText::new(format!("[{}]", vol.drive_letter))
+                                                                            .color(tc.green)
+                                                                            .strong()
+                                                                            .monospace()
+                                                                            .size(10.0),
+                                                                    );
+                                                                }
+                                                            }
                                                             if !dev.manufacturer.is_empty() {
                                                                 ui.add(
                                                                     egui::Label::new(
@@ -1648,10 +2520,9 @@ impl eframe::App for DeviceHistoryApp {
                                                             }
                                                         });
 
-                                                        // Row 2: timestamps, times seen, buttons
+                                                        // Row 2: timestamps, times seen (no buttons — moved to detail panel)
                                                         ui.horizontal(|ui| {
                                                             ui.spacing_mut().item_spacing.x = 12.0;
-
                                                             ui.label(
                                                                 egui::RichText::new(format!(
                                                                     "First: {}",
@@ -1676,68 +2547,45 @@ impl eframe::App for DeviceHistoryApp {
                                                                 .color(tc.teal)
                                                                 .size(10.0),
                                                             );
-
-                                                            ui.with_layout(
-                                                                egui::Layout::right_to_left(
-                                                                    egui::Align::Center,
-                                                                ),
-                                                                |ui| {
-                                                                    // Forget button
-                                                                    let forget_btn =
-                                                                        egui::Button::new(
-                                                                            egui::RichText::new(
-                                                                                "Forget",
-                                                                            )
-                                                                            .color(tc.red)
-                                                                            .size(10.0),
-                                                                        )
-                                                                        .fill(
-                                                                            egui::Color32::TRANSPARENT,
-                                                                        )
-                                                                        .stroke(egui::Stroke::new(
-                                                                            0.5, tc.red,
-                                                                        ))
-                                                                        .rounding(3.0);
-
-                                                                    if ui.add(forget_btn).clicked()
-                                                                    {
-                                                                        forget_id = Some(
-                                                                            dev.device_id.clone(),
-                                                                        );
-                                                                    }
-
-                                                                    // Copy button
-                                                                    let copy_btn =
-                                                                        egui::Button::new(
-                                                                            egui::RichText::new(
-                                                                                "Copy",
-                                                                            )
-                                                                            .color(tc.text_sec)
-                                                                            .size(10.0),
-                                                                        )
-                                                                        .fill(
-                                                                            egui::Color32::TRANSPARENT,
-                                                                        )
-                                                                        .stroke(egui::Stroke::new(
-                                                                            0.5, tc.border,
-                                                                        ))
-                                                                        .rounding(3.0);
-
-                                                                    if ui.add(copy_btn).clicked() {
-                                                                        ui.output_mut(|o| {
-                                                                            o.copied_text =
-                                                                                dev.device_id
-                                                                                    .clone();
-                                                                        });
-                                                                    }
-                                                                },
-                                                            );
                                                         });
                                                     });
 
-                                                // Hover tooltip with full device_id
-                                                resp.response
-                                                    .on_hover_text(&dev.device_id);
+                                                // Click interaction
+                                                let click_resp = ui.interact(
+                                                    frame_resp.response.rect,
+                                                    egui::Id::new("known_click").with(kd_idx),
+                                                    egui::Sense::click(),
+                                                );
+                                                if click_resp.clicked() {
+                                                    if is_selected {
+                                                        selected_device = None;
+                                                    } else {
+                                                        selected_device = Some(dev.device_id.clone());
+                                                        nickname_buf = dev.nickname.clone().unwrap_or_default();
+                                                    }
+                                                }
+                                                if click_resp.hovered() {
+                                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                                }
+
+                                                // Inline detail panel
+                                                if is_selected {
+                                                    let dev_si = storage_info.get(&dev.device_id)
+                                                        .or(dev.storage_info.as_ref());
+                                                    let vid_pid_opt = if dev.vid_pid.is_empty() { None } else { Some(dev.vid_pid.clone()) };
+                                                    draw_device_detail_panel(
+                                                        ui, &tc, &dev.device_id, &dev.name,
+                                                        vid_pid_opt, &dev.class,
+                                                        Some(dev.manufacturer.as_str()).filter(|s| !s.is_empty()),
+                                                        Some(dev.description.as_str()).filter(|s| !s.is_empty()),
+                                                        Some(dev), dev_si,
+                                                        &mut nickname_buf,
+                                                        &state_arc,
+                                                        dev.currently_connected,
+                                                    );
+                                                    // Check if forget was requested in detail panel
+                                                    // (handled inside draw_device_detail_panel via state_arc)
+                                                }
                                             }
 
                                             // Process forget action
@@ -1762,6 +2610,8 @@ impl eframe::App for DeviceHistoryApp {
         self.search_query = search_query;
         self.sort_mode = sort_mode;
         self.sort_ascending = sort_ascending;
+        self.selected_device = selected_device;
+        self.nickname_buf = nickname_buf;
     }
 }
 
@@ -1810,7 +2660,7 @@ fn run_cli() {
 
     println!(
         "{} {} USB devices currently connected:\n",
-        "\u{25CF}".green(),
+        "*".green(),
         devices.len().to_string().bold()
     );
 
@@ -1828,7 +2678,7 @@ fn run_cli() {
             .unwrap_or_default();
         println!(
             "  {} {} {}{}{}",
-            "\u{2022}".dimmed(),
+            "|".dimmed(),
             dev.class().dimmed(),
             dev.display_name(),
             vid_pid.dimmed(),
@@ -1914,6 +2764,7 @@ fn main() {
         events: Vec::new(),
         error: None,
         known_devices: cache,
+        storage_info: HashMap::new(),
     }));
 
     let state_bg = state.clone();
