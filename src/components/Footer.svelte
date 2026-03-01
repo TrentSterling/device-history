@@ -11,6 +11,14 @@
   <span class="sep">·</span>
   <span class="footer-item log-path">📄 device-history.log</span>
   <span class="spacer"></span>
+  <button
+    class="footer-btn"
+    class:active={app.soundEnabled}
+    onclick={() => app.toggleSound()}
+    title={app.soundEnabled ? "Sound notifications on" : "Sound notifications off"}
+  >
+    {app.soundEnabled ? "🔔" : "🔕"}
+  </button>
   <button class="footer-btn" onclick={() => app.exportEventsCSV()} title="Export events to CSV">
     Export CSV
   </button>
@@ -72,6 +80,10 @@
     transition: all 150ms;
   }
   .footer-btn:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .footer-btn.active {
     border-color: var(--accent);
     color: var(--accent);
   }

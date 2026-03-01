@@ -77,6 +77,10 @@
     font-size: 24px;
     filter: drop-shadow(0 0 6px var(--accent-glow));
     animation: float 4s ease-in-out infinite;
+    transition: transform 300ms cubic-bezier(0.34, 1.56, 0.64, 1);
+  }
+  .header-left:hover .logo {
+    transform: translateX(-2px) translateY(-1px) scale(1.1);
   }
   .title {
     font-size: 20px;
@@ -86,6 +90,10 @@
     -webkit-text-fill-color: transparent;
     background-clip: text;
     text-shadow: none;
+    transition: transform 300ms cubic-bezier(0.34, 1.56, 0.64, 1);
+  }
+  .header-left:hover .title {
+    transform: translateX(2px);
   }
   .version {
     font-size: 11px;
