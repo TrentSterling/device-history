@@ -91,53 +91,6 @@ html, body, #app {
   --shadow-color: rgba(0, 0, 0, 0.3);
 }
 
-/* ── Nord ─────────────────────────────────────────────────── */
-.theme-nord {
-  --bg-deep: #2e3440;
-  --bg-surface: #353b49;
-  --bg-elevated: #3e4555;
-  --border: #4c566a;
-  --accent: #88c0d0;
-  --accent-glow: rgba(136, 192, 208, 0.15);
-  --accent-glow-strong: rgba(136, 192, 208, 0.35);
-  --orange: #d08770;
-  --teal: #8fbcbb;
-  --green: #a3be8c;
-  --red: #bf616a;
-  --yellow: #ebcb8b;
-  --pink: #b48ead;
-  --cyan: #88c0d0;
-  --text: #eceff4;
-  --text-sec: #d8dee9;
-  --text-muted: #7b88a0;
-  --glass-bg: rgba(53, 59, 73, 0.75);
-  --glass-border: rgba(76, 86, 106, 0.6);
-  --shadow-color: rgba(0, 0, 0, 0.3);
-}
-
-/* ── Solarized Dark ───────────────────────────────────────── */
-.theme-solarized {
-  --bg-deep: #002b36;
-  --bg-surface: #073642;
-  --bg-elevated: #0e404d;
-  --border: #586e75;
-  --accent: #268bd2;
-  --accent-glow: rgba(38, 139, 210, 0.15);
-  --accent-glow-strong: rgba(38, 139, 210, 0.35);
-  --orange: #cb4b16;
-  --teal: #2aa198;
-  --green: #859900;
-  --red: #dc322f;
-  --yellow: #b58900;
-  --pink: #d33682;
-  --cyan: #2aa198;
-  --text: #fdf6e3;
-  --text-sec: #93a1a1;
-  --text-muted: #657b83;
-  --glass-bg: rgba(7, 54, 66, 0.75);
-  --glass-border: rgba(88, 110, 117, 0.6);
-  --shadow-color: rgba(0, 0, 0, 0.3);
-}
 
 /* ── Base layout ──────────────────────────────────────────── */
 #app {

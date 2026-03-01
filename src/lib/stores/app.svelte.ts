@@ -71,7 +71,8 @@ class AppState {
       let cmp = 0;
       switch (mode) {
         case "status":
-          cmp = Number(a.currently_connected) - Number(b.currently_connected);
+          // Connected first (descending bool), then alphabetical
+          cmp = Number(b.currently_connected) - Number(a.currently_connected);
           if (cmp === 0)
             cmp = a.name.toLowerCase().localeCompare(b.name.toLowerCase());
           break;
@@ -79,13 +80,16 @@ class AppState {
           cmp = a.name.toLowerCase().localeCompare(b.name.toLowerCase());
           break;
         case "last_seen":
-          cmp = a.last_seen.localeCompare(b.last_seen);
+          // Most recent first
+          cmp = b.last_seen.localeCompare(a.last_seen);
           break;
         case "times_seen":
-          cmp = a.times_seen - b.times_seen;
+          // Most-seen first
+          cmp = b.times_seen - a.times_seen;
           break;
         case "first_seen":
-          cmp = a.first_seen.localeCompare(b.first_seen);
+          // Most recent first
+          cmp = b.first_seen.localeCompare(a.first_seen);
           break;
       }
       return asc ? cmp : -cmp;
@@ -117,7 +121,8 @@ class AppState {
     // Load prefs
     try {
       const prefs = await cmd.getPrefs();
-      this.theme = prefs.theme || "neon";
+      const validThemes = ["neon", "dracula", "mocha"];
+      this.theme = validThemes.includes(prefs.theme) ? prefs.theme : "neon";
       this.activeTab = prefs.active_tab === "known" ? "known" : "monitor";
     } catch (e) {
       console.error("Failed to load prefs:", e);

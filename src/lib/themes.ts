@@ -6,10 +6,8 @@ export interface ThemeMeta {
 
 export const themes: ThemeMeta[] = [
   { id: "neon", label: "Neon", className: "theme-neon" },
-  { id: "mocha", label: "Mocha", className: "theme-mocha" },
   { id: "dracula", label: "Dracula", className: "theme-dracula" },
-  { id: "nord", label: "Nord", className: "theme-nord" },
-  { id: "solarized", label: "Solar", className: "theme-solarized" },
+  { id: "mocha", label: "Mocha", className: "theme-mocha" },
 ];
 
 export function themeClass(id: string): string {
