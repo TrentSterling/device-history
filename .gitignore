@@ -1,10 +1,19 @@
+# Rust
 /target
-*.log
-Cargo.lock
+src-tauri/target
+
+# Node
+node_modules/
+dist/
 
 # App data
 *-cache.json
 *.prefs
+*.log
 
 # Claude
 .claude/
+
+# OS
+Thumbs.db
+.DS_Store

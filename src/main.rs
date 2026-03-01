@@ -2,12 +2,18 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use chrono::Local;
-use eframe::egui;
+use iced::widget::{
+    button, column, container, horizontal_rule, horizontal_space, progress_bar, row, scrollable,
+    text, text_input, Column, Row, Space,
+};
+use iced::{
+    color, Element, Length, Subscription, Task as IcedTask, Theme,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write as IoWrite;
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
@@ -35,7 +41,6 @@ mod win32 {
     static CACHED_HWND: AtomicIsize = AtomicIsize::new(0);
 
     pub fn find_hwnd() -> Option<isize> {
-        // Try cached handle first
         let cached = CACHED_HWND.load(Ordering::Relaxed);
         if cached != 0 && unsafe { IsWindow(cached) } != 0 {
             return Some(cached);
@@ -193,7 +198,6 @@ fn query_volumes_for_drive(drive: &WmiDiskDrive) -> Vec<VolumeInfo> {
         None => return vec![],
     };
 
-    // Extract disk index from DeviceID like \\.\PHYSICALDRIVE2
     let disk_index = match device_id
         .to_uppercase()
         .rsplit("PHYSICALDRIVE")
@@ -210,7 +214,6 @@ fn query_volumes_for_drive(drive: &WmiDiskDrive) -> Vec<VolumeInfo> {
         }
     };
 
-    // Use PowerShell Get-Partition + Get-Volume (reliable on Win10/11)
     let ps_script = format!(
         "$ErrorActionPreference='SilentlyContinue'; \
          Get-Partition -DiskNumber {} | Where-Object {{ $_.DriveLetter }} | ForEach-Object {{ \
@@ -247,7 +250,6 @@ fn query_volumes_for_drive(drive: &WmiDiskDrive) -> Vec<VolumeInfo> {
         return vec![];
     }
 
-    // PowerShell returns single object (not array) when only 1 result
     #[derive(Deserialize)]
     #[allow(non_snake_case)]
     struct PsVolume {
@@ -298,13 +300,11 @@ fn query_volumes_for_drive(drive: &WmiDiskDrive) -> Vec<VolumeInfo> {
 }
 
 fn query_storage_info(wmi: &WMIConnection, device_id: &str) -> Option<StorageInfo> {
-    // Extract USB serial suffix from device_id: USB\VID_xxxx&PID_yyyy\<serial>
     let usb_serial = device_id.rsplit('\\').next()?.to_uppercase();
     if usb_serial.is_empty() {
         return None;
     }
 
-    // Query ALL disk drives — UAS drives show as InterfaceType=SCSI, not USB
     let drives: Vec<WmiDiskDrive> = match wmi.raw_query(
         "SELECT DeviceID, PNPDeviceID, Model, SerialNumber, Size, InterfaceType, \
          MediaType, Partitions, FirmwareRevision, Status \
@@ -337,33 +337,27 @@ fn query_storage_info(wmi: &WMIConnection, device_id: &str) -> Option<StorageInf
         return None;
     }
 
-    // Match strategy (in priority order):
-    // 1. DiskDrive serial is a substring of USB serial or vice versa
-    //    e.g. USB serial "MSFT30NA8PE7LY" contains drive serial "NA8PE7LY"
-    // 2. DiskDrive PNPDeviceID contains the USB serial suffix
-    //    e.g. USBSTOR\...\WXF2D92FUV2S&0 contains "WXF2D92FUV2S"
-    let matched = drives
-        .iter()
-        .find(|d| {
-            // Check serial number match
-            if let Some(serial) = &d.SerialNumber {
-                let s = serial.trim().replace(' ', "").to_uppercase();
-                if !s.is_empty() && (s.contains(&usb_serial) || usb_serial.contains(&s)) {
-                    return true;
-                }
+    let matched = drives.iter().find(|d| {
+        if let Some(serial) = &d.SerialNumber {
+            let s = serial.trim().replace(' ', "").to_uppercase();
+            if !s.is_empty() && (s.contains(&usb_serial) || usb_serial.contains(&s)) {
+                return true;
             }
-            // Check PNPDeviceID match (for USBSTOR drives)
-            if let Some(pnp) = &d.PNPDeviceID {
-                let p = pnp.to_uppercase();
-                if p.contains(&usb_serial) {
-                    return true;
-                }
+        }
+        if let Some(pnp) = &d.PNPDeviceID {
+            let p = pnp.to_uppercase();
+            if p.contains(&usb_serial) {
+                return true;
             }
-            false
-        });
+        }
+        false
+    });
 
     if matched.is_none() {
-        log_to_file(&format!("ENRICH FAIL: no drive matched usb_serial={}", usb_serial));
+        log_to_file(&format!(
+            "ENRICH FAIL: no drive matched usb_serial={}",
+            usb_serial
+        ));
         return None;
     }
     let matched = matched?;
@@ -374,7 +368,11 @@ fn query_storage_info(wmi: &WMIConnection, device_id: &str) -> Option<StorageInf
         matched.Model.as_deref().unwrap_or("?"),
         matched.SerialNumber.as_deref().unwrap_or("?").trim(),
         volumes.len(),
-        volumes.iter().map(|v| v.drive_letter.as_str()).collect::<Vec<_>>().join(", ")
+        volumes
+            .iter()
+            .map(|v| v.drive_letter.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
     ));
 
     Some(StorageInfo {
@@ -464,20 +462,13 @@ enum EventKind {
     Disconnect,
 }
 
-struct AppState {
-    devices: Vec<(String, UsbDevice)>,
-    events: Vec<DeviceEvent>,
-    error: Option<String>,
-    known_devices: KnownDeviceCache,
-    storage_info: HashMap<String, StorageInfo>,
-}
+// AppState was used by the old egui Arc<Mutex> approach; now replaced by MonitorSnapshot channel
 
 // ── Preferences ────────────────────────────────────────────────
 
 const PREFS_FILE: &str = "device-history.prefs";
 
 struct Prefs {
-    about_open: bool,
     theme: String,
     active_tab: String,
 }
@@ -485,7 +476,6 @@ struct Prefs {
 impl Prefs {
     fn load() -> Self {
         let defaults = Self {
-            about_open: true,
             theme: "Neon".to_string(),
             active_tab: "Monitor".to_string(),
         };
@@ -496,7 +486,6 @@ impl Prefs {
         for line in content.lines() {
             if let Some((key, val)) = line.split_once('=') {
                 match key.trim() {
-                    "about_open" => prefs.about_open = val.trim() == "true",
                     "theme" => prefs.theme = val.trim().to_string(),
                     "active_tab" => prefs.active_tab = val.trim().to_string(),
                     _ => {}
@@ -508,8 +497,8 @@ impl Prefs {
 
     fn save(&self) {
         let content = format!(
-            "about_open={}\ntheme={}\nactive_tab={}\n",
-            self.about_open, self.theme, self.active_tab
+            "theme={}\nactive_tab={}\n",
+            self.theme, self.active_tab
         );
         let _ = std::fs::write(PREFS_FILE, content);
     }
@@ -525,22 +514,40 @@ fn log_to_file(msg: &str) {
 
 // ── Background monitor thread ──────────────────────────────────
 
-fn monitor_loop(state: Arc<Mutex<AppState>>) {
+/// Snapshot sent from monitor thread to UI
+#[derive(Clone)]
+struct MonitorSnapshot {
+    devices: Vec<(String, UsbDevice)>,
+    events: Vec<DeviceEvent>,
+    known_devices: KnownDeviceCache,
+    storage_info: HashMap<String, StorageInfo>,
+    error: Option<String>,
+}
+
+fn monitor_loop(tx: mpsc::Sender<MonitorSnapshot>) {
     let com = match COMLibrary::new() {
         Ok(c) => c,
         Err(e) => {
-            if let Ok(mut s) = state.lock() {
-                s.error = Some(format!("COM init failed: {}", e));
-            }
+            let _ = tx.send(MonitorSnapshot {
+                devices: vec![],
+                events: vec![],
+                known_devices: KnownDeviceCache::new(),
+                storage_info: HashMap::new(),
+                error: Some(format!("COM init failed: {}", e)),
+            });
             return;
         }
     };
     let wmi = match WMIConnection::new(com) {
         Ok(w) => w,
         Err(e) => {
-            if let Ok(mut s) = state.lock() {
-                s.error = Some(format!("WMI connect failed: {}", e));
-            }
+            let _ = tx.send(MonitorSnapshot {
+                devices: vec![],
+                events: vec![],
+                known_devices: KnownDeviceCache::new(),
+                storage_info: HashMap::new(),
+                error: Some(format!("WMI connect failed: {}", e)),
+            });
             return;
         }
     };
@@ -548,65 +555,57 @@ fn monitor_loop(state: Arc<Mutex<AppState>>) {
     let mut prev = match query_devices(&wmi) {
         Some(d) => d,
         None => {
-            if let Ok(mut s) = state.lock() {
-                s.error = Some("Failed to query USB devices".into());
-            }
+            let _ = tx.send(MonitorSnapshot {
+                devices: vec![],
+                events: vec![],
+                known_devices: KnownDeviceCache::new(),
+                storage_info: HashMap::new(),
+                error: Some("Failed to query USB devices".into()),
+            });
             return;
         }
     };
 
+    let mut known_devices = load_cache();
+    let mut storage_info: HashMap<String, StorageInfo> = HashMap::new();
+    let mut all_events: Vec<DeviceEvent> = Vec::new();
+
     // Initial snapshot — merge into cache
     {
         let now = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
-        if let Ok(mut s) = state.lock() {
-            // Mark all cached devices as offline
-            for dev in s.known_devices.devices.values_mut() {
-                dev.currently_connected = false;
-            }
-
-            // Merge current devices into cache
-            for (id, dev) in &prev {
-                let is_new = !s.known_devices.devices.contains_key(id);
-                let entry =
-                    s.known_devices
-                        .devices
-                        .entry(id.clone())
-                        .or_insert_with(|| KnownDevice {
-                            device_id: id.clone(),
-                            name: dev.display_name().to_string(),
-                            vid_pid: dev.vid_pid().unwrap_or_default(),
-                            class: dev.class().to_string(),
-                            manufacturer: dev.Manufacturer.clone().unwrap_or_default(),
-                            description: dev.Description.clone().unwrap_or_default(),
-                            first_seen: now.clone(),
-                            last_seen: now.clone(),
-                            times_seen: 1,
-                            currently_connected: true,
-                            nickname: None,
-                            storage_info: None,
-                        });
-                if !is_new {
-                    entry.last_seen = now.clone();
-                    entry.currently_connected = true;
-                    entry.name = dev.display_name().to_string();
-                    entry.vid_pid = dev.vid_pid().unwrap_or_default();
-                    entry.class = dev.class().to_string();
-                    entry.manufacturer = dev.Manufacturer.clone().unwrap_or_default();
-                    entry.description = dev.Description.clone().unwrap_or_default();
-                }
-            }
-
-            let mut sorted: Vec<_> =
-                prev.iter().map(|(id, d)| (id.clone(), d.clone())).collect();
-            sorted.sort_by(|a, b| {
-                a.1.display_name()
-                    .to_lowercase()
-                    .cmp(&b.1.display_name().to_lowercase())
-            });
-            s.devices = sorted;
-
-            save_cache(&s.known_devices);
+        for dev in known_devices.devices.values_mut() {
+            dev.currently_connected = false;
         }
+        for (id, dev) in &prev {
+            let is_new = !known_devices.devices.contains_key(id);
+            let entry = known_devices
+                .devices
+                .entry(id.clone())
+                .or_insert_with(|| KnownDevice {
+                    device_id: id.clone(),
+                    name: dev.display_name().to_string(),
+                    vid_pid: dev.vid_pid().unwrap_or_default(),
+                    class: dev.class().to_string(),
+                    manufacturer: dev.Manufacturer.clone().unwrap_or_default(),
+                    description: dev.Description.clone().unwrap_or_default(),
+                    first_seen: now.clone(),
+                    last_seen: now.clone(),
+                    times_seen: 1,
+                    currently_connected: true,
+                    nickname: None,
+                    storage_info: None,
+                });
+            if !is_new {
+                entry.last_seen = now.clone();
+                entry.currently_connected = true;
+                entry.name = dev.display_name().to_string();
+                entry.vid_pid = dev.vid_pid().unwrap_or_default();
+                entry.class = dev.class().to_string();
+                entry.manufacturer = dev.Manufacturer.clone().unwrap_or_default();
+                entry.description = dev.Description.clone().unwrap_or_default();
+            }
+        }
+        save_cache(&known_devices);
     }
 
     // Initial enrichment for connected storage devices
@@ -623,16 +622,29 @@ fn monitor_loop(state: Arc<Mutex<AppState>>) {
                         .collect::<Vec<_>>()
                         .join(", ")
                 ));
-                if let Ok(mut s) = state.lock() {
-                    s.storage_info.insert(id.clone(), info.clone());
-                    if let Some(kd) = s.known_devices.devices.get_mut(id) {
-                        kd.storage_info = Some(info);
-                    }
-                    save_cache(&s.known_devices);
+                storage_info.insert(id.clone(), info.clone());
+                if let Some(kd) = known_devices.devices.get_mut(id) {
+                    kd.storage_info = Some(info);
                 }
+                save_cache(&known_devices);
             }
         }
     }
+
+    // Send initial snapshot
+    let mut sorted: Vec<_> = prev.iter().map(|(id, d)| (id.clone(), d.clone())).collect();
+    sorted.sort_by(|a, b| {
+        a.1.display_name()
+            .to_lowercase()
+            .cmp(&b.1.display_name().to_lowercase())
+    });
+    let _ = tx.send(MonitorSnapshot {
+        devices: sorted,
+        events: all_events.clone(),
+        known_devices: known_devices.clone(),
+        storage_info: storage_info.clone(),
+        error: None,
+    });
 
     log_to_file(&format!("Started monitoring — {} devices", prev.len()));
 
@@ -645,11 +657,15 @@ fn monitor_loop(state: Arc<Mutex<AppState>>) {
         let now_instant = Instant::now();
         let ready: Vec<String> = pending_enrichments
             .iter()
-            .filter(|(_, scheduled)| now_instant.duration_since(*scheduled) >= Duration::from_secs(2))
+            .filter(|(_, scheduled)| {
+                now_instant.duration_since(*scheduled) >= Duration::from_secs(2)
+            })
             .map(|(id, _)| id.clone())
             .collect();
-        pending_enrichments
-            .retain(|(_, scheduled)| now_instant.duration_since(*scheduled) < Duration::from_secs(2));
+        pending_enrichments.retain(|(_, scheduled)| {
+            now_instant.duration_since(*scheduled) < Duration::from_secs(2)
+        });
+        let mut enriched = false;
         for enrich_id in ready {
             if let Some(info) = query_storage_info(&wmi, &enrich_id) {
                 log_to_file(&format!(
@@ -662,13 +678,12 @@ fn monitor_loop(state: Arc<Mutex<AppState>>) {
                         .collect::<Vec<_>>()
                         .join(", ")
                 ));
-                if let Ok(mut s) = state.lock() {
-                    s.storage_info.insert(enrich_id.clone(), info.clone());
-                    if let Some(kd) = s.known_devices.devices.get_mut(&enrich_id) {
-                        kd.storage_info = Some(info);
-                    }
-                    save_cache(&s.known_devices);
+                storage_info.insert(enrich_id.clone(), info.clone());
+                if let Some(kd) = known_devices.devices.get_mut(&enrich_id) {
+                    kd.storage_info = Some(info);
                 }
+                save_cache(&known_devices);
+                enriched = true;
             }
         }
 
@@ -723,7 +738,6 @@ fn monitor_loop(state: Arc<Mutex<AppState>>) {
         }
 
         if !new_events.is_empty() {
-            // Collect IDs for enrichment/cleanup before consuming events
             let enrich_ids: Vec<String> = new_events
                 .iter()
                 .filter(|e| e.kind == EventKind::Connect)
@@ -734,76 +748,88 @@ fn monitor_loop(state: Arc<Mutex<AppState>>) {
                 })
                 .map(|e| e.device_id.clone())
                 .collect();
-            if let Ok(mut s) = state.lock() {
-                // Update cache for each event
-                for event in &new_events {
-                    match event.kind {
-                        EventKind::Connect => {
-                            if let Some(dev) = current.get(&event.device_id) {
-                                let is_new =
-                                    !s.known_devices.devices.contains_key(&event.device_id);
-                                let entry = s
-                                    .known_devices
-                                    .devices
-                                    .entry(event.device_id.clone())
-                                    .or_insert_with(|| KnownDevice {
-                                        device_id: event.device_id.clone(),
-                                        name: dev.display_name().to_string(),
-                                        vid_pid: dev.vid_pid().unwrap_or_default(),
-                                        class: dev.class().to_string(),
-                                        manufacturer: dev.Manufacturer.clone().unwrap_or_default(),
-                                        description: dev.Description.clone().unwrap_or_default(),
-                                        first_seen: now_iso.clone(),
-                                        last_seen: now_iso.clone(),
-                                        times_seen: 0,
-                                        currently_connected: true,
-                                        nickname: None,
-                                        storage_info: None,
-                                    });
-                                entry.times_seen += 1;
-                                entry.last_seen = now_iso.clone();
-                                entry.currently_connected = true;
-                                if !is_new {
-                                    entry.name = dev.display_name().to_string();
-                                    entry.vid_pid = dev.vid_pid().unwrap_or_default();
-                                    entry.class = dev.class().to_string();
-                                    entry.manufacturer =
-                                        dev.Manufacturer.clone().unwrap_or_default();
-                                    entry.description =
-                                        dev.Description.clone().unwrap_or_default();
-                                }
+
+            for event in &new_events {
+                match event.kind {
+                    EventKind::Connect => {
+                        if let Some(dev) = current.get(&event.device_id) {
+                            let is_new =
+                                !known_devices.devices.contains_key(&event.device_id);
+                            let entry = known_devices
+                                .devices
+                                .entry(event.device_id.clone())
+                                .or_insert_with(|| KnownDevice {
+                                    device_id: event.device_id.clone(),
+                                    name: dev.display_name().to_string(),
+                                    vid_pid: dev.vid_pid().unwrap_or_default(),
+                                    class: dev.class().to_string(),
+                                    manufacturer: dev
+                                        .Manufacturer
+                                        .clone()
+                                        .unwrap_or_default(),
+                                    description: dev
+                                        .Description
+                                        .clone()
+                                        .unwrap_or_default(),
+                                    first_seen: now_iso.clone(),
+                                    last_seen: now_iso.clone(),
+                                    times_seen: 0,
+                                    currently_connected: true,
+                                    nickname: None,
+                                    storage_info: None,
+                                });
+                            entry.times_seen += 1;
+                            entry.last_seen = now_iso.clone();
+                            entry.currently_connected = true;
+                            if !is_new {
+                                entry.name = dev.display_name().to_string();
+                                entry.vid_pid = dev.vid_pid().unwrap_or_default();
+                                entry.class = dev.class().to_string();
+                                entry.manufacturer =
+                                    dev.Manufacturer.clone().unwrap_or_default();
+                                entry.description =
+                                    dev.Description.clone().unwrap_or_default();
                             }
-                        }
-                        EventKind::Disconnect => {
-                            if let Some(entry) =
-                                s.known_devices.devices.get_mut(&event.device_id)
-                            {
-                                entry.last_seen = now_iso.clone();
-                                entry.currently_connected = false;
-                            }
-                            // Remove live storage info on disconnect
-                            s.storage_info.remove(&event.device_id);
                         }
                     }
+                    EventKind::Disconnect => {
+                        if let Some(entry) =
+                            known_devices.devices.get_mut(&event.device_id)
+                        {
+                            entry.last_seen = now_iso.clone();
+                            entry.currently_connected = false;
+                        }
+                        storage_info.remove(&event.device_id);
+                    }
                 }
-
-                s.events.extend(new_events);
-                let mut sorted: Vec<_> =
-                    current.iter().map(|(id, d)| (id.clone(), d.clone())).collect();
-                sorted.sort_by(|a, b| {
-                    a.1.display_name()
-                        .to_lowercase()
-                        .cmp(&b.1.display_name().to_lowercase())
-                });
-                s.devices = sorted;
-
-                save_cache(&s.known_devices);
             }
 
-            // Schedule enrichment for connected storage devices (2s delay)
+            all_events.extend(new_events);
+            save_cache(&known_devices);
+
             for id in enrich_ids {
                 pending_enrichments.push((id, Instant::now()));
             }
+        }
+
+        if !all_events.is_empty()
+            || enriched
+            || prev.len() != current.len()
+        {
+            let mut sorted: Vec<_> =
+                current.iter().map(|(id, d)| (id.clone(), d.clone())).collect();
+            sorted.sort_by(|a, b| {
+                a.1.display_name()
+                    .to_lowercase()
+                    .cmp(&b.1.display_name().to_lowercase())
+            });
+            let _ = tx.send(MonitorSnapshot {
+                devices: sorted,
+                events: all_events.clone(),
+                known_devices: known_devices.clone(),
+                storage_info: storage_info.clone(),
+                error: None,
+            });
         }
 
         prev = current;
@@ -812,589 +838,187 @@ fn monitor_loop(state: Arc<Mutex<AppState>>) {
 
 // ── Theme system ───────────────────────────────────────────────
 
-#[derive(Clone, Copy, PartialEq)]
-enum Theme {
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum AppTheme {
     Neon,
-    Light,
-    Mids,
+    CatppuccinMocha,
+    Dracula,
+    Nord,
+    Solarized,
 }
 
-impl Theme {
+impl AppTheme {
+    const ALL: [AppTheme; 5] = [
+        AppTheme::Neon,
+        AppTheme::CatppuccinMocha,
+        AppTheme::Dracula,
+        AppTheme::Nord,
+        AppTheme::Solarized,
+    ];
+
     fn label(self) -> &'static str {
         match self {
-            Theme::Neon => "Neon",
-            Theme::Light => "Light",
-            Theme::Mids => "Mids",
+            AppTheme::Neon => "Neon",
+            AppTheme::CatppuccinMocha => "Mocha",
+            AppTheme::Dracula => "Dracula",
+            AppTheme::Nord => "Nord",
+            AppTheme::Solarized => "Solar",
         }
     }
 
     fn from_label(s: &str) -> Self {
         match s {
-            "Light" => Theme::Light,
-            "Mids" => Theme::Mids,
-            _ => Theme::Neon,
+            "Mocha" | "CatppuccinMocha" => AppTheme::CatppuccinMocha,
+            "Dracula" => AppTheme::Dracula,
+            "Nord" => AppTheme::Nord,
+            "Solar" | "Solarized" => AppTheme::Solarized,
+            _ => AppTheme::Neon,
         }
+    }
+
+    fn save_key(self) -> &'static str {
+        match self {
+            AppTheme::Neon => "Neon",
+            AppTheme::CatppuccinMocha => "CatppuccinMocha",
+            AppTheme::Dracula => "Dracula",
+            AppTheme::Nord => "Nord",
+            AppTheme::Solarized => "Solar",
+        }
+    }
+
+    fn iced_theme(self) -> Theme {
+        let tc = self.colors();
+        Theme::custom(
+            self.label().to_string(),
+            iced::theme::Palette {
+                background: tc.bg_deep,
+                text: tc.text,
+                primary: tc.accent,
+                success: tc.green,
+                danger: tc.red,
+            },
+        )
     }
 
     fn colors(self) -> ThemeColors {
         match self {
-            Theme::Neon => ThemeColors {
-                bg_deep: c(0x0d, 0x0f, 0x14),
-                bg_surface: c(0x1a, 0x1c, 0x23),
-                bg_elevated: c(0x22, 0x25, 0x2e),
-                border: c(0x2a, 0x2d, 0x3a),
-                accent: c(0xa8, 0x55, 0xf7),
-                orange: c(0xff, 0x8b, 0x3d),
-                teal: c(0x2e, 0xe6, 0xd7),
-                green: c(0x50, 0xfa, 0x7b),
-                red: c(0xff, 0x55, 0x55),
-                yellow: c(0xf1, 0xfa, 0x8c),
-                pink: c(0xff, 0x79, 0xc6),
-                cyan: c(0x8b, 0xe9, 0xfd),
-                text: c(0xe8, 0xe8, 0xf0),
-                text_sec: c(0x8c, 0x8c, 0xa0),
-                text_muted: c(0x72, 0x74, 0x88),
-                dark_mode: true,
+            AppTheme::Neon => ThemeColors {
+                bg_deep: color!(0x0d, 0x0f, 0x14),
+                bg_surface: color!(0x1a, 0x1c, 0x23),
+                bg_elevated: color!(0x22, 0x25, 0x2e),
+                border: color!(0x2a, 0x2d, 0x3a),
+                accent: color!(0xa8, 0x55, 0xf7),
+                orange: color!(0xff, 0x8b, 0x3d),
+                teal: color!(0x2e, 0xe6, 0xd7),
+                green: color!(0x50, 0xfa, 0x7b),
+                red: color!(0xff, 0x55, 0x55),
+                yellow: color!(0xf1, 0xfa, 0x8c),
+                pink: color!(0xff, 0x79, 0xc6),
+                cyan: color!(0x8b, 0xe9, 0xfd),
+                text: color!(0xe8, 0xe8, 0xf0),
+                text_sec: color!(0x8c, 0x8c, 0xa0),
+                text_muted: color!(0x72, 0x74, 0x88),
             },
-            Theme::Light => ThemeColors {
-                bg_deep: c(0xf2, 0xf2, 0xf7),
-                bg_surface: c(0xff, 0xff, 0xff),
-                bg_elevated: c(0xe8, 0xe8, 0xf0),
-                border: c(0xd0, 0xd0, 0xdd),
-                accent: c(0x7c, 0x3a, 0xed),
-                orange: c(0xea, 0x58, 0x0c),
-                teal: c(0x0d, 0x94, 0x88),
-                green: c(0x16, 0xa3, 0x4a),
-                red: c(0xdc, 0x26, 0x26),
-                yellow: c(0xa1, 0x6b, 0x07),
-                pink: c(0xdb, 0x27, 0x77),
-                cyan: c(0x06, 0x7a, 0x99),
-                text: c(0x1a, 0x1a, 0x2e),
-                text_sec: c(0x64, 0x74, 0x8b),
-                text_muted: c(0x94, 0xa3, 0xb8),
-                dark_mode: false,
+            AppTheme::CatppuccinMocha => ThemeColors {
+                bg_deep: color!(0x1e, 0x1e, 0x2e),
+                bg_surface: color!(0x28, 0x28, 0x3a),
+                bg_elevated: color!(0x36, 0x37, 0x4a),
+                border: color!(0x58, 0x5b, 0x70),
+                accent: color!(0xca, 0xa6, 0xf7),
+                orange: color!(0xfa, 0xb3, 0x87),
+                teal: color!(0x94, 0xe2, 0xd5),
+                green: color!(0xa6, 0xe3, 0xa1),
+                red: color!(0xf3, 0x8b, 0xa8),
+                yellow: color!(0xf9, 0xe2, 0xaf),
+                pink: color!(0xf5, 0xc2, 0xe7),
+                cyan: color!(0x89, 0xdc, 0xeb),
+                text: color!(0xcd, 0xd6, 0xf4),
+                text_sec: color!(0xba, 0xc2, 0xde),
+                text_muted: color!(0x7f, 0x84, 0x9c),
             },
-            Theme::Mids => ThemeColors {
-                bg_deep: c(0x2a, 0x2c, 0x35),
-                bg_surface: c(0x36, 0x38, 0x44),
-                bg_elevated: c(0x42, 0x44, 0x52),
-                border: c(0x52, 0x54, 0x66),
-                accent: c(0x9b, 0x7d, 0xff),
-                orange: c(0xff, 0x9f, 0x5a),
-                teal: c(0x4d, 0xd8, 0xcc),
-                green: c(0x6b, 0xe8, 0x8a),
-                red: c(0xff, 0x6e, 0x6e),
-                yellow: c(0xe8, 0xd4, 0x6e),
-                pink: c(0xff, 0x8f, 0xd0),
-                cyan: c(0x7d, 0xcc, 0xe8),
-                text: c(0xd8, 0xd8, 0xe4),
-                text_sec: c(0x98, 0x98, 0xac),
-                text_muted: c(0x6e, 0x70, 0x82),
-                dark_mode: true,
+            AppTheme::Dracula => ThemeColors {
+                bg_deep: color!(0x28, 0x2a, 0x36),
+                bg_surface: color!(0x30, 0x32, 0x40),
+                bg_elevated: color!(0x3c, 0x3f, 0x50),
+                border: color!(0x62, 0x72, 0xa4),
+                accent: color!(0xbd, 0x93, 0xf9),
+                orange: color!(0xff, 0xb8, 0x6c),
+                teal: color!(0x8b, 0xe9, 0xfd),
+                green: color!(0x50, 0xfa, 0x7b),
+                red: color!(0xff, 0x55, 0x55),
+                yellow: color!(0xf1, 0xfa, 0x8c),
+                pink: color!(0xff, 0x79, 0xc6),
+                cyan: color!(0x8b, 0xe9, 0xfd),
+                text: color!(0xf8, 0xf8, 0xf2),
+                text_sec: color!(0xd0, 0xd2, 0xdc),
+                text_muted: color!(0x7e, 0x8c, 0xb4),
+            },
+            AppTheme::Nord => ThemeColors {
+                bg_deep: color!(0x2e, 0x34, 0x40),
+                bg_surface: color!(0x35, 0x3b, 0x49),
+                bg_elevated: color!(0x3e, 0x45, 0x55),
+                border: color!(0x4c, 0x56, 0x6a),
+                accent: color!(0x88, 0xc0, 0xd0),
+                orange: color!(0xd0, 0x87, 0x70),
+                teal: color!(0x8f, 0xbc, 0xbb),
+                green: color!(0xa3, 0xbe, 0x8c),
+                red: color!(0xbf, 0x61, 0x6a),
+                yellow: color!(0xeb, 0xcb, 0x8b),
+                pink: color!(0xb4, 0x8e, 0xad),
+                cyan: color!(0x88, 0xc0, 0xd0),
+                text: color!(0xec, 0xef, 0xf4),
+                text_sec: color!(0xd8, 0xde, 0xe9),
+                text_muted: color!(0x7b, 0x88, 0xa0),
+            },
+            AppTheme::Solarized => ThemeColors {
+                bg_deep: color!(0x00, 0x2b, 0x36),
+                bg_surface: color!(0x07, 0x36, 0x42),
+                bg_elevated: color!(0x0e, 0x40, 0x4d),
+                border: color!(0x58, 0x6e, 0x75),
+                accent: color!(0x26, 0x8b, 0xd2),
+                orange: color!(0xcb, 0x4b, 0x16),
+                teal: color!(0x2a, 0xa1, 0x98),
+                green: color!(0x85, 0x99, 0x00),
+                red: color!(0xdc, 0x32, 0x2f),
+                yellow: color!(0xb5, 0x89, 0x00),
+                pink: color!(0xd3, 0x36, 0x82),
+                cyan: color!(0x2a, 0xa1, 0x98),
+                text: color!(0xfd, 0xf6, 0xe3),
+                text_sec: color!(0x93, 0xa1, 0xa1),
+                text_muted: color!(0x65, 0x7b, 0x83),
             },
         }
     }
-}
-
-const fn c(r: u8, g: u8, b: u8) -> egui::Color32 {
-    egui::Color32::from_rgb(r, g, b)
 }
 
 #[derive(Clone, Copy)]
 struct ThemeColors {
-    bg_deep: egui::Color32,
-    bg_surface: egui::Color32,
-    bg_elevated: egui::Color32,
-    border: egui::Color32,
-    accent: egui::Color32,
-    orange: egui::Color32,
-    teal: egui::Color32,
-    green: egui::Color32,
-    red: egui::Color32,
-    yellow: egui::Color32,
-    pink: egui::Color32,
-    cyan: egui::Color32,
-    text: egui::Color32,
-    text_sec: egui::Color32,
-    text_muted: egui::Color32,
-    dark_mode: bool,
-}
-
-// ── Helpers ────────────────────────────────────────────────────
-
-fn blend(base: egui::Color32, target: egui::Color32, t: f32) -> egui::Color32 {
-    let m = |a: u8, b: u8| (a as f32 * (1.0 - t) + b as f32 * t).clamp(0.0, 255.0) as u8;
-    egui::Color32::from_rgb(
-        m(base.r(), target.r()),
-        m(base.g(), target.g()),
-        m(base.b(), target.b()),
-    )
-}
-
-fn load_icon() -> Option<egui::IconData> {
-    let png_bytes = include_bytes!("../assets/icon.png");
-    let img = image::load_from_memory(png_bytes).ok()?.into_rgba8();
-    let (w, h) = img.dimensions();
-    Some(egui::IconData {
-        rgba: img.into_raw(),
-        width: w,
-        height: h,
-    })
-}
-
-fn apply_theme(ctx: &egui::Context, tc: &ThemeColors) {
-    ctx.set_visuals({
-        let mut v = if tc.dark_mode {
-            egui::Visuals::dark()
-        } else {
-            egui::Visuals::light()
-        };
-
-        v.panel_fill = tc.bg_deep;
-        v.window_fill = tc.bg_surface;
-        v.extreme_bg_color = tc.bg_deep;
-        v.faint_bg_color = tc.bg_elevated;
-
-        v.widgets.noninteractive.bg_fill = tc.bg_surface;
-        v.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, tc.text_sec);
-        v.widgets.noninteractive.bg_stroke = egui::Stroke::new(0.5, tc.border);
-        v.widgets.noninteractive.rounding = egui::Rounding::same(4.0);
-
-        v.widgets.inactive.bg_fill = tc.bg_elevated;
-        v.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, tc.text);
-        v.widgets.inactive.bg_stroke = egui::Stroke::new(0.5, tc.border);
-        v.widgets.inactive.rounding = egui::Rounding::same(4.0);
-
-        v.widgets.hovered.bg_fill = blend(tc.bg_elevated, tc.accent, 0.15);
-        v.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, tc.text);
-        v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, tc.accent);
-        v.widgets.hovered.rounding = egui::Rounding::same(4.0);
-
-        v.widgets.active.bg_fill = blend(tc.bg_elevated, tc.accent, 0.25);
-        v.widgets.active.fg_stroke = egui::Stroke::new(1.0, tc.text);
-        v.widgets.active.bg_stroke = egui::Stroke::new(1.5, tc.accent);
-        v.widgets.active.rounding = egui::Rounding::same(4.0);
-
-        v.selection.bg_fill = blend(tc.bg_surface, tc.accent, 0.2);
-        v.selection.stroke = egui::Stroke::new(1.0, tc.accent);
-
-        v.window_rounding = egui::Rounding::same(6.0);
-        v.window_shadow = egui::Shadow {
-            offset: egui::Vec2::new(0.0, 2.0),
-            blur: 8.0,
-            spread: 0.0,
-            color: egui::Color32::from_black_alpha(if tc.dark_mode { 80 } else { 30 }),
-        };
-
-        v.collapsing_header_frame = true;
-        v.override_text_color = Some(tc.text);
-
-        v
-    });
-}
-
-fn draw_rainbow_separator(ui: &mut egui::Ui, tc: &ThemeColors) {
-    let colors = [
-        tc.red, tc.orange, tc.yellow, tc.green, tc.teal, tc.cyan, tc.accent, tc.pink,
-    ];
-    let w = ui.available_width();
-    let h = 2.0;
-    let (rect, _) = ui.allocate_exact_size(egui::Vec2::new(w, h), egui::Sense::hover());
-    let painter = ui.painter_at(rect);
-    let seg_w = w / colors.len() as f32;
-
-    for i in 0..colors.len() {
-        let c0 = colors[i];
-        let c1 = colors[(i + 1) % colors.len()];
-        let subs = 8;
-        let sub_w = seg_w / subs as f32;
-        for s in 0..subs {
-            let t = s as f32 / subs as f32;
-            let color = blend(c0, c1, t);
-            let x = rect.left() + i as f32 * seg_w + s as f32 * sub_w;
-            painter.rect_filled(
-                egui::Rect::from_min_size(
-                    egui::Pos2::new(x, rect.top()),
-                    egui::Vec2::new(sub_w + 0.5, h),
-                ),
-                0.0,
-                color,
-            );
-        }
-    }
-}
-
-// ── Device Detail Panel ─────────────────────────────────────────
-
-#[allow(clippy::too_many_arguments)]
-fn draw_device_detail_panel(
-    ui: &mut egui::Ui,
-    tc: &ThemeColors,
-    device_id: &str,
-    device_name: &str,
-    vid_pid: Option<String>,
-    class: &str,
-    manufacturer: Option<&str>,
-    description: Option<&str>,
-    known_device: Option<&KnownDevice>,
-    storage_info: Option<&StorageInfo>,
-    nickname_buf: &mut String,
-    state_arc: &Arc<Mutex<AppState>>,
-    is_connected: bool,
-) {
-    let detail_frame = egui::Frame::none()
-        .fill(blend(tc.bg_surface, tc.accent, 0.03))
-        .rounding(egui::Rounding {
-            nw: 0.0,
-            ne: 0.0,
-            sw: 6.0,
-            se: 6.0,
-        })
-        .stroke(egui::Stroke::new(1.0, blend(tc.border, tc.accent, 0.3)))
-        .inner_margin(egui::Margin::same(12.0));
-
-    detail_frame.show(ui, |ui: &mut egui::Ui| {
-        ui.set_width(ui.available_width());
-        ui.spacing_mut().item_spacing.y = 4.0;
-
-        // ── Header: drive info FIRST if storage device ──
-        if let Some(si) = storage_info {
-            // Big drive letter + volume name as the headline
-            for vol in &si.volumes {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(&vol.drive_letter)
-                            .color(tc.green)
-                            .strong()
-                            .monospace()
-                            .size(20.0),
-                    );
-                    if !vol.volume_name.is_empty() {
-                        ui.label(
-                            egui::RichText::new(format!("\"{}\"", vol.volume_name))
-                                .color(tc.text)
-                                .strong()
-                                .size(16.0),
-                        );
-                    }
-                    ui.label(
-                        egui::RichText::new(format!("({})", vol.file_system))
-                            .color(tc.text_sec)
-                            .size(12.0),
-                    );
-                });
-
-                // Capacity bar right under the headline
-                if vol.total_bytes > 0 {
-                    let free_str = format_bytes(vol.free_bytes);
-                    let total_str = format_bytes(vol.total_bytes);
-                    let used_frac = 1.0 - (vol.free_bytes as f32 / vol.total_bytes as f32);
-                    let bar_color = if used_frac < 0.7 {
-                        tc.green
-                    } else if used_frac < 0.9 {
-                        tc.yellow
-                    } else {
-                        tc.red
-                    };
-                    let bar_width = (ui.available_width() - 10.0).max(100.0);
-                    let bar_height = 10.0;
-                    let (bar_rect, _) = ui.allocate_exact_size(
-                        egui::Vec2::new(bar_width, bar_height),
-                        egui::Sense::hover(),
-                    );
-                    let painter = ui.painter_at(bar_rect);
-                    painter.rect_filled(bar_rect, 4.0, tc.bg_elevated);
-                    let filled_rect = egui::Rect::from_min_size(
-                        bar_rect.left_top(),
-                        egui::Vec2::new(bar_width * used_frac, bar_height),
-                    );
-                    painter.rect_filled(filled_rect, 4.0, bar_color);
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "{} free / {}  ({:.0}% used)",
-                            free_str, total_str, used_frac * 100.0
-                        ))
-                        .color(tc.text_sec)
-                        .size(11.0),
-                    );
-                }
-            }
-
-            // Model + serial on one line
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new(&si.model)
-                        .color(tc.text)
-                        .size(12.0),
-                );
-                if !si.serial_number.is_empty() {
-                    ui.label(
-                        egui::RichText::new(format!("({})", si.serial_number))
-                            .color(tc.text_sec)
-                            .monospace()
-                            .size(11.0),
-                    );
-                }
-            });
-
-            if !is_connected {
-                ui.label(
-                    egui::RichText::new("OFFLINE -- showing last known info")
-                        .color(tc.orange)
-                        .italics()
-                        .size(10.0),
-                );
-            }
-
-            ui.add_space(2.0);
-            let sep_rect = ui.allocate_exact_size(
-                egui::Vec2::new(ui.available_width(), 1.0),
-                egui::Sense::hover(),
-            ).0;
-            ui.painter().rect_filled(sep_rect, 0.0, tc.border);
-            ui.add_space(2.0);
-        } else {
-            // Non-storage device: just show name as header
-            ui.label(
-                egui::RichText::new(device_name)
-                    .strong()
-                    .size(14.0)
-                    .color(tc.text),
-            );
-        }
-
-        // ── Nickname editing ──
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new("Nickname:")
-                    .color(tc.text_sec)
-                    .size(11.0),
-            );
-            let te = egui::TextEdit::singleline(nickname_buf)
-                .hint_text("e.g. My 4TB Seagate")
-                .desired_width(200.0)
-                .text_color(tc.text);
-            ui.add(te);
-            let save_btn = egui::Button::new(
-                egui::RichText::new("Save").color(tc.teal).size(11.0),
-            )
-            .fill(egui::Color32::TRANSPARENT)
-            .stroke(egui::Stroke::new(0.5, tc.teal))
-            .rounding(3.0);
-            if ui.add(save_btn).clicked() {
-                let nick = if nickname_buf.trim().is_empty() {
-                    None
-                } else {
-                    Some(nickname_buf.trim().to_string())
-                };
-                if let Ok(mut s) = state_arc.lock() {
-                    if let Some(kd) = s.known_devices.devices.get_mut(device_id) {
-                        kd.nickname = nick;
-                    }
-                    save_cache(&s.known_devices);
-                }
-            }
-        });
-
-        ui.add_space(4.0);
-
-        // ── STORAGE technical details ──
-        if let Some(si) = storage_info {
-            // Compact detail row: interface, firmware, partitions, status
-            let detail_rows = [
-                ("Interface:", si.interface_type.as_str()),
-                ("Firmware:", si.firmware.as_str()),
-                ("Status:", si.status.as_str()),
-            ];
-            for (label, value) in &detail_rows {
-                if !value.is_empty() {
-                    ui.horizontal(|ui| {
-                        ui.label(
-                            egui::RichText::new(*label)
-                                .color(tc.text_sec)
-                                .size(11.0),
-                        );
-                        ui.label(
-                            egui::RichText::new(*value)
-                                .color(tc.text)
-                                .monospace()
-                                .size(11.0),
-                        );
-                    });
-                }
-            }
-
-            ui.add_space(4.0);
-            // Thin separator
-            let sep_rect = ui.allocate_exact_size(
-                egui::Vec2::new(ui.available_width(), 1.0),
-                egui::Sense::hover(),
-            ).0;
-            ui.painter().rect_filled(sep_rect, 0.0, tc.border);
-            ui.add_space(4.0);
-        }
-
-        // ── DEVICE INFO section ──
-        ui.label(
-            egui::RichText::new("DEVICE INFO")
-                .strong()
-                .size(12.0)
-                .color(tc.cyan),
-        );
-
-        let info_rows: Vec<(&str, String)> = vec![
-            ("Device ID:", device_id.to_string()),
-            (
-                "VID:PID:",
-                vid_pid.clone().unwrap_or_else(|| "-".to_string()),
-            ),
-            ("Class:", class.to_string()),
-            (
-                "Manufacturer:",
-                manufacturer.unwrap_or("-").to_string(),
-            ),
-            (
-                "Description:",
-                description.unwrap_or("-").to_string(),
-            ),
-        ];
-        for (label, value) in &info_rows {
-            ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new(*label)
-                        .color(tc.text_sec)
-                        .size(11.0),
-                );
-                ui.add(
-                    egui::Label::new(
-                        egui::RichText::new(value)
-                            .color(tc.text)
-                            .monospace()
-                            .size(11.0),
-                    )
-                    .truncate(),
-                );
-            });
-        }
-
-        // ── HISTORY section ──
-        if let Some(kd) = known_device {
-            ui.add_space(4.0);
-            let sep_rect = ui.allocate_exact_size(
-                egui::Vec2::new(ui.available_width(), 1.0),
-                egui::Sense::hover(),
-            ).0;
-            ui.painter().rect_filled(sep_rect, 0.0, tc.border);
-            ui.add_space(4.0);
-
-            ui.label(
-                egui::RichText::new("HISTORY")
-                    .strong()
-                    .size(12.0)
-                    .color(tc.cyan),
-            );
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 16.0;
-                ui.label(
-                    egui::RichText::new(format!("First seen: {}", kd.first_seen))
-                        .color(tc.text_sec)
-                        .size(11.0),
-                );
-                ui.label(
-                    egui::RichText::new(format!("Last seen: {}", kd.last_seen))
-                        .color(tc.text_sec)
-                        .size(11.0),
-                );
-                ui.label(
-                    egui::RichText::new(format!("Times seen: {}x", kd.times_seen))
-                        .color(tc.teal)
-                        .size(11.0),
-                );
-            });
-        }
-
-        // ── Action buttons ──
-        ui.add_space(6.0);
-        let sep_rect = ui.allocate_exact_size(
-            egui::Vec2::new(ui.available_width(), 1.0),
-            egui::Sense::hover(),
-        ).0;
-        ui.painter().rect_filled(sep_rect, 0.0, tc.border);
-        ui.add_space(4.0);
-
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = 8.0;
-
-            // Copy Device ID
-            let copy_id_btn = egui::Button::new(
-                egui::RichText::new("Copy Device ID")
-                    .color(tc.text_sec)
-                    .size(11.0),
-            )
-            .fill(egui::Color32::TRANSPARENT)
-            .stroke(egui::Stroke::new(0.5, tc.border))
-            .rounding(3.0);
-            if ui.add(copy_id_btn).clicked() {
-                ui.output_mut(|o| {
-                    o.copied_text = device_id.to_string();
-                });
-            }
-
-            // Copy Serial (if storage info available)
-            if let Some(si) = storage_info {
-                if !si.serial_number.is_empty() {
-                    let copy_serial_btn = egui::Button::new(
-                        egui::RichText::new("Copy Serial")
-                            .color(tc.text_sec)
-                            .size(11.0),
-                    )
-                    .fill(egui::Color32::TRANSPARENT)
-                    .stroke(egui::Stroke::new(0.5, tc.border))
-                    .rounding(3.0);
-                    if ui.add(copy_serial_btn).clicked() {
-                        ui.output_mut(|o| {
-                            o.copied_text = si.serial_number.clone();
-                        });
-                    }
-                }
-            }
-
-            // Forget button
-            let forget_btn = egui::Button::new(
-                egui::RichText::new("Forget")
-                    .color(tc.red)
-                    .size(11.0),
-            )
-            .fill(egui::Color32::TRANSPARENT)
-            .stroke(egui::Stroke::new(0.5, tc.red))
-            .rounding(3.0);
-            if ui.add(forget_btn).clicked() {
-                if let Ok(mut s) = state_arc.lock() {
-                    s.known_devices.devices.remove(device_id);
-                    s.storage_info.remove(device_id);
-                    save_cache(&s.known_devices);
-                }
-            }
-        });
-    });
+    bg_deep: iced::Color,
+    bg_surface: iced::Color,
+    bg_elevated: iced::Color,
+    border: iced::Color,
+    accent: iced::Color,
+    orange: iced::Color,
+    teal: iced::Color,
+    green: iced::Color,
+    red: iced::Color,
+    yellow: iced::Color,
+    pink: iced::Color,
+    cyan: iced::Color,
+    text: iced::Color,
+    text_sec: iced::Color,
+    text_muted: iced::Color,
 }
 
 // ── Tab + Sort enums ───────────────────────────────────────────
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum ActiveTab {
     Monitor,
     KnownDevices,
 }
 
 impl ActiveTab {
-    fn label(self) -> &'static str {
-        match self {
-            ActiveTab::Monitor => "Monitor",
-            ActiveTab::KnownDevices => "Known Devices",
-        }
-    }
-
     fn from_label(s: &str) -> Self {
         match s {
             "KnownDevices" => ActiveTab::KnownDevices,
@@ -1410,7 +1034,7 @@ impl ActiveTab {
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum SortMode {
     Status,
     Name,
@@ -1420,6 +1044,14 @@ enum SortMode {
 }
 
 impl SortMode {
+    const ALL: [SortMode; 5] = [
+        SortMode::Status,
+        SortMode::Name,
+        SortMode::LastSeen,
+        SortMode::TimesSeen,
+        SortMode::FirstSeen,
+    ];
+
     fn label(self) -> &'static str {
         match self {
             SortMode::Status => "Status",
@@ -1431,7 +1063,14 @@ impl SortMode {
     }
 }
 
-// ── GUI ────────────────────────────────────────────────────────
+// ── Tray ────────────────────────────────────────────────────────
+
+#[derive(Clone, Debug)]
+enum TrayAction {
+    Show,
+    Hide,
+    Exit,
+}
 
 struct TrayMenuIds {
     show: tray_icon::menu::MenuId,
@@ -1439,1210 +1078,1603 @@ struct TrayMenuIds {
     exit: tray_icon::menu::MenuId,
 }
 
+// ── Messages ───────────────────────────────────────────────────
+
+#[derive(Clone, Debug)]
+enum Message {
+    // Background monitor
+    PollMonitor,
+    #[allow(dead_code)]
+    MonitorUpdate(MonitorSnapshot),
+
+    // UI
+    TabSelected(ActiveTab),
+    ThemeChanged(AppTheme),
+    SearchChanged(String),
+    SortBy(SortMode),
+    #[allow(dead_code)]
+    ToggleSortDirection,
+    SelectDevice(Option<String>),
+    NicknameChanged(String),
+    SaveNickname,
+    ForgetDevice(String),
+    ClearEvents,
+    CopyToClipboard(String),
+    OpenUrl(String),
+
+    // System
+    UpdateAvailable(Option<String>),
+    PollTray,
+    #[allow(dead_code)]
+    TrayEvent(TrayAction),
+    #[allow(dead_code)]
+    CloseRequested,
+
+    // System (reserved for future close handling)
+    #[allow(dead_code)]
+    Noop,
+}
+
+impl std::fmt::Debug for MonitorSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MonitorSnapshot")
+            .field("devices", &self.devices.len())
+            .field("events", &self.events.len())
+            .finish()
+    }
+}
+
+// ── Iced Application ───────────────────────────────────────────
+
 struct DeviceHistoryApp {
-    state: Arc<Mutex<AppState>>,
-    theme: Theme,
+    // Data
+    devices: Vec<(String, UsbDevice)>,
+    events: Vec<DeviceEvent>,
+    known_devices: KnownDeviceCache,
+    storage_info: HashMap<String, StorageInfo>,
+    error: Option<String>,
+
+    // Monitor channel
+    monitor_rx: Arc<Mutex<mpsc::Receiver<MonitorSnapshot>>>,
+
+    // UI state
+    app_theme: AppTheme,
     colors: ThemeColors,
-    needs_theme_apply: bool,
-    show_about: bool,
-    update_available: Arc<Mutex<Option<String>>>,
-    tray_menu_ids: TrayMenuIds,
-    hidden: bool,
     active_tab: ActiveTab,
     search_query: String,
     sort_mode: SortMode,
     sort_ascending: bool,
     selected_device: Option<String>,
     nickname_buf: String,
+
+    // System
+    update_available: Option<String>,
+    #[allow(dead_code)]
+    tray_menu_ids: Arc<TrayMenuIds>,
+    tray_rx: Arc<Mutex<mpsc::Receiver<TrayAction>>>,
 }
 
 impl DeviceHistoryApp {
-    fn new(state: Arc<Mutex<AppState>>, tray_menu_ids: TrayMenuIds) -> Self {
+    fn new(
+        monitor_rx: mpsc::Receiver<MonitorSnapshot>,
+        tray_menu_ids: TrayMenuIds,
+        tray_rx: mpsc::Receiver<TrayAction>,
+    ) -> (Self, IcedTask<Message>) {
         let prefs = Prefs::load();
-        let theme = Theme::from_label(&prefs.theme);
-        let update_available = Arc::new(Mutex::new(None));
+        let app_theme = AppTheme::from_label(&prefs.theme);
 
-        // Background update check
-        let update_flag = update_available.clone();
-        thread::spawn(move || {
-            let current = env!("CARGO_PKG_VERSION");
-            let resp = ureq::get(
-                "https://api.github.com/repos/TrentSterling/device-history/releases/latest",
-            )
-            .set("User-Agent", "device-history")
-            .call();
-            if let Ok(resp) = resp {
-                if let Ok(body) = resp.into_string() {
-                    if let Some(start) = body.find("\"tag_name\"") {
-                        let rest = &body[start..];
-                        if let Some(colon) = rest.find(':') {
-                            let after_colon = rest[colon + 1..].trim_start();
-                            if after_colon.starts_with('"') {
-                                let val_start = 1;
-                                if let Some(val_end) = after_colon[val_start..].find('"') {
-                                    let tag = &after_colon[val_start..val_start + val_end];
-                                    let latest = tag.trim_start_matches('v');
-                                    if latest != current {
-                                        if let Ok(mut u) = update_flag.lock() {
-                                            *u = Some(latest.to_string());
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        });
-
-        Self {
-            state,
-            theme,
-            colors: theme.colors(),
-            needs_theme_apply: true,
-            show_about: prefs.about_open,
-            update_available,
-            tray_menu_ids,
-            hidden: false,
+        let app = Self {
+            devices: vec![],
+            events: vec![],
+            known_devices: load_cache(),
+            storage_info: HashMap::new(),
+            error: None,
+            monitor_rx: Arc::new(Mutex::new(monitor_rx)),
+            app_theme,
+            colors: app_theme.colors(),
             active_tab: ActiveTab::from_label(&prefs.active_tab),
             search_query: String::new(),
             sort_mode: SortMode::Status,
             sort_ascending: true,
             selected_device: None,
             nickname_buf: String::new(),
-        }
+            update_available: None,
+            tray_menu_ids: Arc::new(tray_menu_ids),
+            tray_rx: Arc::new(Mutex::new(tray_rx)),
+        };
+
+        // Kick off update check
+        let task = IcedTask::perform(check_for_updates(), Message::UpdateAvailable);
+
+        (app, task)
     }
 
     fn save_prefs(&self) {
         let prefs = Prefs {
-            about_open: self.show_about,
-            theme: self.theme.label().to_string(),
+            theme: self.app_theme.save_key().to_string(),
             active_tab: self.active_tab.save_key().to_string(),
         };
         prefs.save();
     }
-}
 
-impl eframe::App for DeviceHistoryApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // ── Intercept close button → hide to tray ──
-        if ctx.input(|i| i.viewport().close_requested()) {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            #[cfg(windows)]
-            win32::hide_window();
-            self.hidden = true;
+    fn update(&mut self, message: Message) -> IcedTask<Message> {
+        match message {
+            Message::PollMonitor => {
+                if let Ok(rx) = self.monitor_rx.lock() {
+                    while let Ok(snap) = rx.try_recv() {
+                        self.devices = snap.devices;
+                        self.events = snap.events;
+                        self.known_devices = snap.known_devices;
+                        self.storage_info = snap.storage_info;
+                        if snap.error.is_some() {
+                            self.error = snap.error;
+                        }
+                    }
+                }
+            }
+            Message::MonitorUpdate(snap) => {
+                self.devices = snap.devices;
+                self.events = snap.events;
+                self.known_devices = snap.known_devices;
+                self.storage_info = snap.storage_info;
+                if snap.error.is_some() {
+                    self.error = snap.error;
+                }
+            }
+            Message::TabSelected(tab) => {
+                self.active_tab = tab;
+                self.selected_device = None;
+                self.save_prefs();
+            }
+            Message::ThemeChanged(theme) => {
+                self.app_theme = theme;
+                self.colors = theme.colors();
+                self.save_prefs();
+            }
+            Message::SearchChanged(q) => {
+                self.search_query = q;
+            }
+            Message::SortBy(mode) => {
+                if self.sort_mode == mode {
+                    self.sort_ascending = !self.sort_ascending;
+                } else {
+                    self.sort_mode = mode;
+                    self.sort_ascending = true;
+                }
+            }
+            Message::ToggleSortDirection => {
+                self.sort_ascending = !self.sort_ascending;
+            }
+            Message::SelectDevice(id) => {
+                if let Some(ref dev_id) = id {
+                    if let Some(kd) = self.known_devices.devices.get(dev_id) {
+                        self.nickname_buf = kd.nickname.clone().unwrap_or_default();
+                    } else {
+                        self.nickname_buf.clear();
+                    }
+                }
+                self.selected_device = id;
+            }
+            Message::NicknameChanged(s) => {
+                self.nickname_buf = s;
+            }
+            Message::SaveNickname => {
+                if let Some(ref dev_id) = self.selected_device {
+                    let nick = if self.nickname_buf.trim().is_empty() {
+                        None
+                    } else {
+                        Some(self.nickname_buf.trim().to_string())
+                    };
+                    if let Some(kd) = self.known_devices.devices.get_mut(dev_id) {
+                        kd.nickname = nick;
+                    }
+                    save_cache(&self.known_devices);
+                }
+            }
+            Message::ForgetDevice(id) => {
+                self.known_devices.devices.remove(&id);
+                self.storage_info.remove(&id);
+                save_cache(&self.known_devices);
+                if self.selected_device.as_deref() == Some(&id) {
+                    self.selected_device = None;
+                }
+            }
+            Message::ClearEvents => {
+                self.events.clear();
+            }
+            Message::CopyToClipboard(s) => {
+                return iced::clipboard::write(s);
+            }
+            Message::OpenUrl(url) => {
+                let _ = open::that(&url);
+            }
+            Message::UpdateAvailable(ver) => {
+                self.update_available = ver;
+            }
+            Message::PollTray => {
+                if let Ok(rx) = self.tray_rx.lock() {
+                    while let Ok(action) = rx.try_recv() {
+                        match action {
+                            TrayAction::Show => {
+                                #[cfg(windows)]
+                                win32::show_window();
+                            }
+                            TrayAction::Hide => {
+                                #[cfg(windows)]
+                                win32::hide_window();
+                            }
+                            TrayAction::Exit => {
+                                std::process::exit(0);
+                            }
+                        }
+                    }
+                }
+            }
+            Message::TrayEvent(action) => match action {
+                TrayAction::Show => {
+                    #[cfg(windows)]
+                    win32::show_window();
+                }
+                TrayAction::Hide => {
+                    #[cfg(windows)]
+                    win32::hide_window();
+                }
+                TrayAction::Exit => {
+                    std::process::exit(0);
+                }
+            },
+            Message::CloseRequested => {
+                #[cfg(windows)]
+                win32::hide_window();
+            }
+            Message::Noop => {}
         }
+        IcedTask::none()
+    }
 
-        if self.needs_theme_apply {
-            apply_theme(ctx, &self.colors);
-            self.needs_theme_apply = false;
-        }
+    fn subscription(&self) -> Subscription<Message> {
+        Subscription::batch([
+            iced::time::every(Duration::from_millis(200)).map(|_| Message::PollMonitor),
+            iced::time::every(Duration::from_millis(100)).map(|_| Message::PollTray),
+        ])
+    }
 
-        ctx.request_repaint_after(Duration::from_millis(250));
+    fn theme(&self) -> Theme {
+        self.app_theme.iced_theme()
+    }
 
-        let tc = self.colors;
-        let state_arc = self.state.clone();
+    fn title(&self) -> String {
+        "Device History".to_string()
+    }
 
-        // ── Clone all data from state, drop lock ──
-        let (events, devices, known_devices, error, storage_info) = {
-            let s = self.state.lock().unwrap();
-            (
-                s.events.clone(),
-                s.devices.clone(),
-                s.known_devices.clone(),
-                s.error.clone(),
-                s.storage_info.clone(),
-            )
-        };
+    // ── View ───────────────────────────────────────────────────
 
-        let known_total = known_devices.devices.len();
-        let known_online = known_devices
+    fn view(&self) -> Element<'_, Message> {
+        let tc = &self.colors;
+
+        let known_total = self.known_devices.devices.len();
+        let known_online = self
+            .known_devices
             .devices
             .values()
             .filter(|d| d.currently_connected)
             .count();
 
-        // ── Header ──
-        let mut new_theme: Option<Theme> = None;
-        egui::TopBottomPanel::top("header")
-            .frame(
-                egui::Frame::none()
-                    .fill(tc.bg_surface)
-                    .inner_margin(egui::Margin::symmetric(14.0, 10.0))
-                    .stroke(egui::Stroke::new(1.0, tc.border)),
-            )
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new("Device History")
-                            .strong()
-                            .size(20.0)
-                            .color(tc.accent),
-                    );
-                    ui.add_space(4.0);
-                    ui.label(
-                        egui::RichText::new(format!("v{}", env!("CARGO_PKG_VERSION")))
-                            .size(11.0)
-                            .color(tc.text_muted),
-                    );
-
-                    // Update available banner
-                    if let Ok(guard) = self.update_available.lock() {
-                        if let Some(ver) = guard.as_ref() {
-                            ui.add_space(8.0);
-                            let btn = egui::Button::new(
-                                egui::RichText::new(format!("Update: v{}", ver))
-                                    .size(11.0)
-                                    .color(tc.orange),
-                            )
-                            .fill(egui::Color32::TRANSPARENT)
-                            .stroke(egui::Stroke::new(1.0, tc.orange))
-                            .rounding(4.0);
-                            if ui.add(btn).clicked() {
-                                let _ = open::that(
-                                    "https://github.com/TrentSterling/device-history/releases/latest",
-                                );
-                            }
-                        }
-                    }
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        // Status (rightmost)
-                        if let Some(err) = &error {
-                            ui.label(egui::RichText::new(err).color(tc.pink).size(13.0));
-                        } else {
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "Monitoring {} devices",
-                                    devices.len()
-                                ))
-                                .color(tc.teal)
-                                .size(13.0),
-                            );
-                        }
-
-                        ui.add_space(12.0);
-                        ui.separator();
-                        ui.add_space(4.0);
-
-                        // Theme picker
-                        for t in [Theme::Neon, Theme::Light, Theme::Mids] {
-                            let selected = self.theme == t;
-                            let label_color = if selected { tc.accent } else { tc.text_sec };
-                            let btn = egui::Button::new(
-                                egui::RichText::new(t.label()).size(11.0).color(label_color),
-                            )
-                            .fill(if selected {
-                                blend(tc.bg_elevated, tc.accent, 0.12)
-                            } else {
-                                egui::Color32::TRANSPARENT
-                            })
-                            .stroke(if selected {
-                                egui::Stroke::new(1.0, tc.accent)
-                            } else {
-                                egui::Stroke::new(0.5, tc.border)
-                            })
-                            .rounding(3.0);
-
-                            if ui.add(btn).clicked() && !selected {
-                                new_theme = Some(t);
-                            }
-                        }
-                    });
-                });
-            });
-
-        // Apply theme change
-        if let Some(t) = new_theme {
-            self.theme = t;
-            self.colors = t.colors();
-            self.needs_theme_apply = true;
-            self.save_prefs();
-        }
+        // ── Header row ──
+        let header = self.view_header(&tc);
 
         // ── Tab bar ──
-        let mut new_tab = self.active_tab;
-        egui::TopBottomPanel::top("tabs")
-            .frame(
-                egui::Frame::none()
-                    .fill(tc.bg_surface)
-                    .inner_margin(egui::Margin {
-                        left: 14.0,
-                        right: 14.0,
-                        top: 6.0,
-                        bottom: 0.0,
-                    })
-                    .stroke(egui::Stroke::new(0.5, tc.border)),
-            )
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    for tab in [ActiveTab::Monitor, ActiveTab::KnownDevices] {
-                        let selected = new_tab == tab;
-                        let (fill, text_color, stroke) = if selected {
-                            (tc.bg_deep, tc.accent, egui::Stroke::new(1.0, tc.accent))
-                        } else {
-                            (
-                                tc.bg_elevated,
-                                tc.text_sec,
-                                egui::Stroke::new(0.5, tc.border),
-                            )
-                        };
+        let tab_bar = self.view_tab_bar(&tc, known_total, known_online);
 
-                        let btn = egui::Button::new(
-                            egui::RichText::new(tab.label())
-                                .size(13.0)
-                                .color(text_color)
-                                .strong(),
-                        )
-                        .fill(fill)
-                        .stroke(stroke)
-                        .rounding(egui::Rounding {
-                            nw: 6.0,
-                            ne: 6.0,
-                            sw: 0.0,
-                            se: 0.0,
-                        });
-
-                        if ui.add(btn).clicked() && !selected {
-                            new_tab = tab;
-                        }
-                    }
-
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(
-                            egui::RichText::new(format!(
-                                "{} known ({} online)",
-                                known_total, known_online
-                            ))
-                            .color(tc.text_muted)
-                            .size(12.0),
-                        );
-                    });
-                });
-            });
-
-        if new_tab != self.active_tab {
-            self.active_tab = new_tab;
-            self.save_prefs();
-        }
+        // ── Content ──
+        let content = match self.active_tab {
+            ActiveTab::Monitor => self.view_monitor_tab(&tc),
+            ActiveTab::KnownDevices => self.view_known_devices_tab(&tc),
+        };
 
         // ── Footer ──
-        egui::TopBottomPanel::bottom("footer")
-            .frame(
-                egui::Frame::none()
-                    .fill(tc.bg_surface)
-                    .inner_margin(egui::Margin::symmetric(14.0, 7.0))
-                    .stroke(egui::Stroke::new(1.0, tc.border)),
+        let footer = self.view_footer(&tc, known_total, known_online);
+
+        let layout = column![header, tab_bar, content, footer];
+
+        container(layout)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(move |_theme: &Theme| container::Style {
+                background: Some(iced::Background::Color(tc.bg_deep)),
+                ..Default::default()
+            })
+            .into()
+    }
+
+    fn view_header<'a>(&'a self, tc: &'a ThemeColors) -> Element<'a, Message> {
+        let title = text("Device History")
+            .size(20)
+            .color(tc.accent);
+        let version = text(format!("v{}", env!("CARGO_PKG_VERSION")))
+            .size(11)
+            .color(tc.text_muted);
+
+        let mut header_row = Row::new()
+            .spacing(6)
+            .align_y(iced::Alignment::Center)
+            .push(title)
+            .push(version);
+
+        // Update badge
+        if let Some(ref ver) = self.update_available {
+            let update_btn = button(
+                text(format!("Update: v{}", ver))
+                    .size(11)
+                    .color(tc.orange),
             )
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(format!("{} events logged", events.len()))
-                            .color(tc.text_muted)
-                            .size(12.0),
-                    );
-                    ui.label(egui::RichText::new("|").color(tc.accent).size(10.0));
-                    ui.label(
-                        egui::RichText::new(format!(
-                            "{} known ({} online)",
-                            known_total, known_online
-                        ))
-                        .color(tc.text_muted)
-                        .size(12.0),
-                    );
-                    ui.label(egui::RichText::new("|").color(tc.accent).size(10.0));
-                    ui.label(
-                        egui::RichText::new("Log: device-history.log")
-                            .color(tc.text_muted)
-                            .size(12.0),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(
-                            egui::RichText::new("tront.xyz")
-                                .color(tc.text_muted)
-                                .size(11.0),
-                        );
-                    });
-                });
-            });
-
-        // ── Central panel ──
-        let mut about_open = self.show_about;
-        let mut search_query = self.search_query.clone();
-        let mut sort_mode = self.sort_mode;
-        let mut sort_ascending = self.sort_ascending;
-        let mut selected_device = self.selected_device.clone();
-        let mut nickname_buf = self.nickname_buf.clone();
-
-        egui::CentralPanel::default()
-            .frame(
-                egui::Frame::none()
-                    .fill(tc.bg_deep)
-                    .inner_margin(egui::Margin::symmetric(14.0, 10.0)),
-            )
-            .show(ctx, |ui| {
-                ui.spacing_mut().item_spacing.y = 4.0;
-
-                match self.active_tab {
-                    ActiveTab::Monitor => {
-                        // ── About section ──
-                        let about_id = ui.make_persistent_id("about_section");
-                        let about_state =
-                            egui::collapsing_header::CollapsingState::load_with_default_open(
-                                ctx, about_id, about_open,
-                            );
-                        let was_open = about_state.is_open();
-                        about_state
-                            .show_header(ui, |ui| {
-                                ui.label(
-                                    egui::RichText::new("About")
-                                        .size(13.0)
-                                        .color(tc.text_sec),
-                                );
-                            })
-                            .body(|ui| {
-                                let about_frame = egui::Frame::none()
-                                    .fill(tc.bg_surface)
-                                    .rounding(6.0)
-                                    .stroke(egui::Stroke::new(0.5, tc.border))
-                                    .inner_margin(egui::Margin::same(12.0));
-
-                                about_frame.show(ui, |ui: &mut egui::Ui| {
-                                    ui.spacing_mut().item_spacing.y = 6.0;
-
-                                    ui.label(
-                                        egui::RichText::new("WTF just disconnected?")
-                                            .size(16.0)
-                                            .strong()
-                                            .color(tc.accent),
-                                    );
-                                    ui.add_space(2.0);
-                                    ui.label(
-                                        egui::RichText::new(
-                                            "Real-time USB device monitor for Windows. Watches for \
-                                             connect/disconnect events via WMI polling and logs everything \
-                                             to device-history.log with timestamps.",
-                                        )
-                                        .size(13.0)
-                                        .color(tc.text_sec),
-                                    );
-                                    ui.add_space(4.0);
-
-                                    draw_rainbow_separator(ui, &tc);
-
-                                    ui.add_space(4.0);
-
-                                    let features = [
-                                        (tc.green, "Live monitoring", "500ms poll interval, instant detection"),
-                                        (tc.cyan, "Event log", "Timestamped connect/disconnect history"),
-                                        (tc.yellow, "Device details", "VID:PID, class, manufacturer for every device"),
-                                        (tc.orange, "File logging", "Persistent log at device-history.log"),
-                                        (tc.accent, "Known devices", "Persistent cache of every device ever seen"),
-                                        (tc.pink, "CLI mode", "Run with --cli for terminal output"),
-                                    ];
-
-                                    for (color, title, desc) in &features {
-                                        ui.horizontal(|ui| {
-                                            ui.label(
-                                                egui::RichText::new("|")
-                                                    .color(*color)
-                                                    .size(12.0),
-                                            );
-                                            ui.label(
-                                                egui::RichText::new(*title)
-                                                    .color(tc.text)
-                                                    .strong()
-                                                    .size(12.0),
-                                            );
-                                            ui.label(
-                                                egui::RichText::new(*desc)
-                                                    .color(tc.text_sec)
-                                                    .size(12.0),
-                                            );
-                                        });
-                                    }
-                                });
-                            });
-
-                        let is_open =
-                            egui::collapsing_header::CollapsingState::load_with_default_open(
-                                ctx, about_id, about_open,
-                            )
-                            .is_open();
-                        if is_open != was_open {
-                            about_open = is_open;
-                        }
-
-                        ui.add_space(6.0);
-
-                        // ── Event Log section ──
-                        let events_empty = events.is_empty();
-                        let half_height = (ui.available_height() - 30.0) * 0.45;
-
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new(format!("Event Log ({})", events.len()))
-                                    .size(15.0)
-                                    .color(tc.cyan)
-                                    .strong(),
-                            );
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    let clear_btn = egui::Button::new(
-                                        egui::RichText::new("Clear")
-                                            .color(tc.orange)
-                                            .size(12.0),
-                                    )
-                                    .stroke(egui::Stroke::new(1.0, tc.orange))
-                                    .fill(egui::Color32::TRANSPARENT)
-                                    .rounding(4.0);
-
-                                    if ui.add(clear_btn).clicked() {
-                                        if let Ok(mut s) = state_arc.lock() {
-                                            s.events.clear();
-                                        }
-                                    }
-                                },
-                            );
-                        });
-
-                        ui.add_space(4.0);
-
-                        egui::Frame::none()
-                            .fill(tc.bg_surface)
-                            .rounding(6.0)
-                            .stroke(egui::Stroke::new(1.0, tc.border))
-                            .inner_margin(egui::Margin::same(6.0))
-                            .show(ui, |ui: &mut egui::Ui| {
-                                ui.set_width(ui.available_width());
-                                egui::ScrollArea::vertical()
-                                    .id_salt("event_log")
-                                    .max_height(if events_empty {
-                                        60.0
-                                    } else {
-                                        half_height.max(80.0)
-                                    })
-                                    .stick_to_bottom(true)
-                                    .show(ui, |ui| {
-                                        ui.spacing_mut().item_spacing.y = 3.0;
-
-                                        if events_empty {
-                                            ui.add_space(16.0);
-                                            ui.vertical_centered(|ui| {
-                                                ui.label(
-                                                    egui::RichText::new(
-                                                        "No events yet -- waiting for USB changes...",
-                                                    )
-                                                    .color(tc.text_sec)
-                                                    .italics()
-                                                    .size(13.0),
-                                                );
-                                            });
-                                        } else {
-                                            for (ev_idx, event) in events.iter().enumerate() {
-                                                let is_selected = selected_device.as_deref() == Some(&event.device_id);
-                                                let (accent, icon, label) = match event.kind {
-                                                    EventKind::Connect => {
-                                                        (tc.green, "^", "CONNECT")
-                                                    }
-                                                    EventKind::Disconnect => {
-                                                        (tc.red, "v", "DISCONNECT")
-                                                    }
-                                                };
-
-                                                let card_fill = if is_selected {
-                                                    blend(tc.bg_elevated, tc.accent, 0.12)
-                                                } else {
-                                                    blend(tc.bg_elevated, accent, 0.05)
-                                                };
-                                                let card_stroke = if is_selected {
-                                                    egui::Stroke::new(1.5, tc.accent)
-                                                } else {
-                                                    egui::Stroke::new(0.5, tc.border)
-                                                };
-
-                                                let frame_resp = egui::Frame::none()
-                                                    .fill(card_fill)
-                                                    .rounding(4.0)
-                                                    .stroke(card_stroke)
-                                                    .inner_margin(egui::Margin {
-                                                        left: 10.0,
-                                                        right: 8.0,
-                                                        top: 4.0,
-                                                        bottom: 4.0,
-                                                    })
-                                                    .show(ui, |ui: &mut egui::Ui| {
-                                                        ui.set_width(ui.available_width());
-                                                        let rect = ui.max_rect();
-
-                                                        ui.painter().rect_filled(
-                                                            egui::Rect::from_min_size(
-                                                                rect.left_top(),
-                                                                egui::Vec2::new(
-                                                                    3.0,
-                                                                    rect.height(),
-                                                                ),
-                                                            ),
-                                                            egui::Rounding {
-                                                                nw: 4.0,
-                                                                sw: 4.0,
-                                                                ne: 0.0,
-                                                                se: 0.0,
-                                                            },
-                                                            accent,
-                                                        );
-
-                                                        ui.horizontal(|ui| {
-                                                            ui.spacing_mut().item_spacing.x = 6.0;
-
-                                                            ui.label(
-                                                                egui::RichText::new(
-                                                                    &event.timestamp,
-                                                                )
-                                                                .color(tc.text_sec)
-                                                                .monospace()
-                                                                .size(12.0),
-                                                            );
-                                                            ui.label(
-                                                                egui::RichText::new(format!(
-                                                                    "{} {}",
-                                                                    icon, label
-                                                                ))
-                                                                .color(accent)
-                                                                .strong()
-                                                                .monospace()
-                                                                .size(12.0),
-                                                            );
-                                                            ui.add(
-                                                                egui::Label::new(
-                                                                    egui::RichText::new(
-                                                                        &event.name,
-                                                                    )
-                                                                    .color(tc.text)
-                                                                    .size(12.0),
-                                                                )
-                                                                .truncate(),
-                                                            );
-                                                            if let Some(vp) = &event.vid_pid {
-                                                                ui.label(
-                                                                    egui::RichText::new(format!(
-                                                                        "[{}]",
-                                                                        vp
-                                                                    ))
-                                                                    .color(tc.yellow)
-                                                                    .monospace()
-                                                                    .size(11.0),
-                                                                );
-                                                            }
-                                                            // Drive letter badge
-                                                            if let Some(si) = storage_info.get(&event.device_id) {
-                                                                for vol in &si.volumes {
-                                                                    ui.label(
-                                                                        egui::RichText::new(format!("[{}]", vol.drive_letter))
-                                                                            .color(tc.green)
-                                                                            .strong()
-                                                                            .monospace()
-                                                                            .size(11.0),
-                                                                    );
-                                                                }
-                                                            }
-                                                            ui.label(
-                                                                egui::RichText::new(&event.class)
-                                                                    .color(tc.accent)
-                                                                    .monospace()
-                                                                    .size(10.0),
-                                                            );
-                                                            if let Some(mfr) = &event.manufacturer
-                                                            {
-                                                                ui.add(
-                                                                    egui::Label::new(
-                                                                        egui::RichText::new(
-                                                                            format!("({})", mfr),
-                                                                        )
-                                                                        .color(tc.text_sec)
-                                                                        .size(11.0),
-                                                                    )
-                                                                    .truncate(),
-                                                                );
-                                                            }
-                                                        });
-                                                    });
-
-                                                // Click interaction
-                                                let click_resp = ui.interact(
-                                                    frame_resp.response.rect,
-                                                    egui::Id::new("event_click").with(ev_idx),
-                                                    egui::Sense::click(),
-                                                );
-                                                if click_resp.clicked() {
-                                                    if is_selected {
-                                                        selected_device = None;
-                                                    } else {
-                                                        selected_device = Some(event.device_id.clone());
-                                                    }
-                                                }
-                                                if click_resp.hovered() {
-                                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                                                }
-                                            }
-                                        }
-                                    });
-                            });
-
-                        ui.add_space(8.0);
-                        draw_rainbow_separator(ui, &tc);
-                        ui.add_space(6.0);
-
-                        // ── Connected Devices section ──
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "Connected Devices ({})",
-                                    devices.len()
-                                ))
-                                .size(15.0)
-                                .color(tc.cyan)
-                                .strong(),
-                            );
-                        });
-
-                        ui.add_space(4.0);
-
-                        egui::Frame::none()
-                            .fill(tc.bg_surface)
-                            .rounding(6.0)
-                            .stroke(egui::Stroke::new(1.0, tc.border))
-                            .inner_margin(egui::Margin::same(6.0))
-                            .show(ui, |ui: &mut egui::Ui| {
-                                ui.set_width(ui.available_width());
-                                let remaining = ui.available_height().max(60.0);
-                                egui::ScrollArea::vertical()
-                                    .id_salt("devices_list")
-                                    .max_height(remaining)
-                                    .show(ui, |ui| {
-                                        ui.spacing_mut().item_spacing.y = 2.0;
-
-                                        for (dev_idx, (dev_id, dev)) in devices.iter().enumerate() {
-                                            let is_selected = selected_device.as_deref() == Some(dev_id.as_str());
-                                            let card_fill = if is_selected {
-                                                blend(tc.bg_elevated, tc.accent, 0.12)
-                                            } else {
-                                                tc.bg_elevated
-                                            };
-                                            let card_stroke = if is_selected {
-                                                egui::Stroke::new(1.5, tc.accent)
-                                            } else {
-                                                egui::Stroke::new(0.5, tc.border)
-                                            };
-
-                                            let frame_resp = egui::Frame::none()
-                                                .fill(card_fill)
-                                                .rounding(4.0)
-                                                .stroke(card_stroke)
-                                                .inner_margin(egui::Margin::symmetric(10.0, 4.0))
-                                                .show(ui, |ui: &mut egui::Ui| {
-                                                    ui.set_width(ui.available_width());
-                                                    ui.horizontal(|ui| {
-                                                        ui.spacing_mut().item_spacing.x = 6.0;
-
-                                                        // Drive info FIRST if storage device
-                                                        let conn_si = storage_info.get(dev_id);
-                                                        if let Some(si) = conn_si {
-                                                            for vol in &si.volumes {
-                                                                ui.label(
-                                                                    egui::RichText::new(&vol.drive_letter)
-                                                                        .color(tc.green)
-                                                                        .strong()
-                                                                        .monospace()
-                                                                        .size(13.0),
-                                                                );
-                                                                if !vol.volume_name.is_empty() {
-                                                                    ui.label(
-                                                                        egui::RichText::new(format!("\"{}\"", vol.volume_name))
-                                                                            .color(tc.text)
-                                                                            .strong()
-                                                                            .size(12.0),
-                                                                    );
-                                                                }
-                                                            }
-                                                            if !si.model.is_empty() {
-                                                                ui.label(
-                                                                    egui::RichText::new(&si.model)
-                                                                        .color(tc.text_sec)
-                                                                        .size(11.0),
-                                                                );
-                                                            }
-                                                        } else {
-                                                            ui.label(
-                                                                egui::RichText::new(dev.class())
-                                                                    .color(tc.accent)
-                                                                    .monospace()
-                                                                    .size(11.0),
-                                                            );
-                                                            ui.add(
-                                                                egui::Label::new(
-                                                                    egui::RichText::new(
-                                                                        dev.display_name(),
-                                                                    )
-                                                                    .color(tc.text)
-                                                                    .size(12.0),
-                                                                )
-                                                                .truncate(),
-                                                            );
-                                                        }
-                                                        // Nickname in teal
-                                                        if let Some(kd) = known_devices.devices.get(dev_id) {
-                                                            if let Some(nick) = &kd.nickname {
-                                                                if !nick.is_empty() {
-                                                                    ui.label(
-                                                                        egui::RichText::new(format!("({})", nick))
-                                                                            .color(tc.teal)
-                                                                            .size(11.0),
-                                                                    );
-                                                                }
-                                                            }
-                                                        }
-                                                        if let Some(vp) = dev.vid_pid() {
-                                                            ui.label(
-                                                                egui::RichText::new(format!(
-                                                                    "[{}]",
-                                                                    vp
-                                                                ))
-                                                                .color(tc.yellow)
-                                                                .monospace()
-                                                                .size(10.0),
-                                                            );
-                                                        }
-                                                        if conn_si.is_none() {
-                                                            if let Some(mfr) = &dev.Manufacturer {
-                                                                ui.add(
-                                                                    egui::Label::new(
-                                                                        egui::RichText::new(mfr)
-                                                                            .color(tc.text_sec)
-                                                                            .size(10.0),
-                                                                    )
-                                                                    .truncate(),
-                                                                );
-                                                            }
-                                                        }
-                                                    });
-                                                });
-
-                                            // Click interaction
-                                            let click_resp = ui.interact(
-                                                frame_resp.response.rect,
-                                                egui::Id::new("connected_click").with(dev_idx),
-                                                egui::Sense::click(),
-                                            );
-                                            if click_resp.clicked() {
-                                                if is_selected {
-                                                    selected_device = None;
-                                                } else {
-                                                    selected_device = Some(dev_id.clone());
-                                                    if let Some(kd) = known_devices.devices.get(dev_id) {
-                                                        nickname_buf = kd.nickname.clone().unwrap_or_default();
-                                                    }
-                                                }
-                                            }
-                                            if click_resp.hovered() {
-                                                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                                            }
-
-                                            // Inline detail panel
-                                            if is_selected {
-                                                let dev_si = storage_info.get(dev_id)
-                                                    .or_else(|| known_devices.devices.get(dev_id).and_then(|kd| kd.storage_info.as_ref()));
-                                                let kd = known_devices.devices.get(dev_id);
-                                                draw_device_detail_panel(
-                                                    ui, &tc, dev_id, dev.display_name(),
-                                                    dev.vid_pid(), dev.class(),
-                                                    dev.Manufacturer.as_deref(),
-                                                    dev.Description.as_deref(),
-                                                    kd, dev_si,
-                                                    &mut nickname_buf,
-                                                    &state_arc,
-                                                    true, // is_connected
-                                                );
-                                            }
-                                        }
-                                    });
-                            });
-                    }
-
-                    ActiveTab::KnownDevices => {
-                        // ── Search bar ──
-                        ui.horizontal(|ui| {
-                            ui.label(
-                                egui::RichText::new("Search:")
-                                    .size(14.0)
-                                    .color(tc.text_sec),
-                            );
-                            let te = egui::TextEdit::singleline(&mut search_query)
-                                .hint_text("Search by name, class, manufacturer, VID:PID...")
-                                .desired_width(300.0)
-                                .text_color(tc.text);
-                            ui.add(te);
-
-                            ui.add_space(12.0);
-
-                            // Sort buttons
-                            for mode in [
-                                SortMode::Status,
-                                SortMode::Name,
-                                SortMode::LastSeen,
-                                SortMode::TimesSeen,
-                                SortMode::FirstSeen,
-                            ] {
-                                let selected = sort_mode == mode;
-                                let arrow = if selected {
-                                    if sort_ascending {
-                                        " ^"
-                                    } else {
-                                        " v"
-                                    }
-                                } else {
-                                    ""
-                                };
-                                let label_color = if selected { tc.accent } else { tc.text_sec };
-                                let btn = egui::Button::new(
-                                    egui::RichText::new(format!("{}{}", mode.label(), arrow))
-                                        .size(11.0)
-                                        .color(label_color),
-                                )
-                                .fill(if selected {
-                                    blend(tc.bg_elevated, tc.accent, 0.12)
-                                } else {
-                                    egui::Color32::TRANSPARENT
-                                })
-                                .stroke(if selected {
-                                    egui::Stroke::new(1.0, tc.accent)
-                                } else {
-                                    egui::Stroke::new(0.5, tc.border)
-                                })
-                                .rounding(3.0);
-
-                                if ui.add(btn).clicked() {
-                                    if selected {
-                                        sort_ascending = !sort_ascending;
-                                    } else {
-                                        sort_mode = mode;
-                                        sort_ascending = true;
-                                    }
-                                }
-                            }
-                        });
-
-                        ui.add_space(6.0);
-
-                        // ── Filter + sort devices ──
-                        let query_lower = search_query.to_lowercase();
-                        let mut filtered: Vec<&KnownDevice> = known_devices
-                            .devices
-                            .values()
-                            .filter(|d| {
-                                if query_lower.is_empty() {
-                                    return true;
-                                }
-                                d.name.to_lowercase().contains(&query_lower)
-                                    || d.device_id.to_lowercase().contains(&query_lower)
-                                    || d.class.to_lowercase().contains(&query_lower)
-                                    || d.manufacturer.to_lowercase().contains(&query_lower)
-                                    || d.vid_pid.to_lowercase().contains(&query_lower)
-                                    || d.nickname.as_deref().unwrap_or("").to_lowercase().contains(&query_lower)
-                            })
-                            .collect();
-
-                        filtered.sort_by(|a, b| {
-                            let cmp = match sort_mode {
-                                SortMode::Status => a
-                                    .currently_connected
-                                    .cmp(&b.currently_connected)
-                                    .then_with(|| {
-                                        a.name.to_lowercase().cmp(&b.name.to_lowercase())
-                                    }),
-                                SortMode::Name => {
-                                    a.name.to_lowercase().cmp(&b.name.to_lowercase())
-                                }
-                                SortMode::LastSeen => a.last_seen.cmp(&b.last_seen)
-                                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
-                                SortMode::TimesSeen => a.times_seen.cmp(&b.times_seen)
-                                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
-                                SortMode::FirstSeen => a.first_seen.cmp(&b.first_seen)
-                                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
-                            };
-                            if sort_ascending {
-                                cmp
-                            } else {
-                                cmp.reverse()
-                            }
-                        });
-
-                        // ── Device cards ──
-                        egui::Frame::none()
-                            .fill(tc.bg_surface)
-                            .rounding(6.0)
-                            .stroke(egui::Stroke::new(1.0, tc.border))
-                            .inner_margin(egui::Margin::same(6.0))
-                            .show(ui, |ui: &mut egui::Ui| {
-                                ui.set_width(ui.available_width());
-                                let remaining = ui.available_height().max(60.0);
-                                egui::ScrollArea::vertical()
-                                    .id_salt("known_devices_list")
-                                    .max_height(remaining)
-                                    .show(ui, |ui| {
-                                        ui.spacing_mut().item_spacing.y = 3.0;
-
-                                        if known_devices.devices.is_empty() {
-                                            ui.add_space(24.0);
-                                            ui.vertical_centered(|ui| {
-                                                ui.label(
-                                                    egui::RichText::new(
-                                                        "No devices seen yet -- plug in a USB device to get started",
-                                                    )
-                                                    .color(tc.text_sec)
-                                                    .italics()
-                                                    .size(13.0),
-                                                );
-                                            });
-                                        } else if filtered.is_empty() {
-                                            ui.add_space(24.0);
-                                            ui.vertical_centered(|ui| {
-                                                ui.label(
-                                                    egui::RichText::new(format!(
-                                                        "No devices matching '{}'",
-                                                        search_query
-                                                    ))
-                                                    .color(tc.text_sec)
-                                                    .italics()
-                                                    .size(13.0),
-                                                );
-                                            });
-                                        } else {
-                                            let forget_id: Option<String> = None;
-
-                                            for (kd_idx, dev) in filtered.iter().enumerate() {
-                                                let is_selected = selected_device.as_deref() == Some(&dev.device_id);
-                                                let card_fill = if is_selected {
-                                                    blend(tc.bg_elevated, tc.accent, 0.10)
-                                                } else if dev.currently_connected {
-                                                    blend(tc.bg_elevated, tc.green, 0.06)
-                                                } else {
-                                                    tc.bg_elevated
-                                                };
-                                                let card_stroke = if is_selected {
-                                                    egui::Stroke::new(1.5, tc.accent)
-                                                } else {
-                                                    egui::Stroke::new(0.5, tc.border)
-                                                };
-
-                                                let frame_resp = egui::Frame::none()
-                                                    .fill(card_fill)
-                                                    .rounding(4.0)
-                                                    .stroke(card_stroke)
-                                                    .inner_margin(egui::Margin {
-                                                        left: 10.0,
-                                                        right: 8.0,
-                                                        top: 5.0,
-                                                        bottom: 5.0,
-                                                    })
-                                                    .show(ui, |ui: &mut egui::Ui| {
-                                                        ui.set_width(ui.available_width());
-
-                                                        // Row 1: status dot, class, name, nickname, vid:pid, drive letter, manufacturer
-                                                        ui.horizontal(|ui| {
-                                                            ui.spacing_mut().item_spacing.x = 6.0;
-
-                                                            let dot_color =
-                                                                if dev.currently_connected {
-                                                                    tc.green
-                                                                } else {
-                                                                    tc.text_muted
-                                                                };
-                                                            ui.label(
-                                                                egui::RichText::new("*")
-                                                                    .color(dot_color)
-                                                                    .size(10.0),
-                                                            );
-                                                            // Drive letter + volume name FIRST if storage device
-                                                            let dev_si = storage_info.get(&dev.device_id)
-                                                                .or(dev.storage_info.as_ref());
-                                                            if let Some(si) = dev_si {
-                                                                for vol in &si.volumes {
-                                                                    ui.label(
-                                                                        egui::RichText::new(&vol.drive_letter)
-                                                                            .color(tc.green)
-                                                                            .strong()
-                                                                            .monospace()
-                                                                            .size(13.0),
-                                                                    );
-                                                                    if !vol.volume_name.is_empty() {
-                                                                        ui.label(
-                                                                            egui::RichText::new(format!("\"{}\"", vol.volume_name))
-                                                                                .color(tc.text)
-                                                                                .strong()
-                                                                                .size(12.0),
-                                                                        );
-                                                                    }
-                                                                }
-                                                                if !si.model.is_empty() {
-                                                                    ui.label(
-                                                                        egui::RichText::new(&si.model)
-                                                                            .color(tc.text_sec)
-                                                                            .size(11.0),
-                                                                    );
-                                                                }
-                                                            } else {
-                                                                // Non-storage: show class + name as before
-                                                                ui.label(
-                                                                    egui::RichText::new(&dev.class)
-                                                                        .color(tc.accent)
-                                                                        .monospace()
-                                                                        .size(11.0),
-                                                                );
-                                                                ui.add(
-                                                                    egui::Label::new(
-                                                                        egui::RichText::new(&dev.name)
-                                                                            .color(tc.text)
-                                                                            .size(12.0),
-                                                                    )
-                                                                    .truncate(),
-                                                                );
-                                                            }
-                                                            // Nickname in teal
-                                                            if let Some(nick) = &dev.nickname {
-                                                                if !nick.is_empty() {
-                                                                    ui.label(
-                                                                        egui::RichText::new(format!("({})", nick))
-                                                                            .color(tc.teal)
-                                                                            .size(11.0),
-                                                                    );
-                                                                }
-                                                            }
-                                                            if !dev.vid_pid.is_empty() {
-                                                                ui.label(
-                                                                    egui::RichText::new(format!(
-                                                                        "[{}]",
-                                                                        dev.vid_pid
-                                                                    ))
-                                                                    .color(tc.yellow)
-                                                                    .monospace()
-                                                                    .size(10.0),
-                                                                );
-                                                            }
-                                                            if dev_si.is_none() && !dev.manufacturer.is_empty() {
-                                                                ui.add(
-                                                                    egui::Label::new(
-                                                                        egui::RichText::new(
-                                                                            &dev.manufacturer,
-                                                                        )
-                                                                        .color(tc.text_sec)
-                                                                        .size(10.0),
-                                                                    )
-                                                                    .truncate(),
-                                                                );
-                                                            }
-                                                        });
-
-                                                        // Row 2: timestamps, times seen (no buttons — moved to detail panel)
-                                                        ui.horizontal(|ui| {
-                                                            ui.spacing_mut().item_spacing.x = 12.0;
-                                                            ui.label(
-                                                                egui::RichText::new(format!(
-                                                                    "First: {}",
-                                                                    dev.first_seen
-                                                                ))
-                                                                .color(tc.text_muted)
-                                                                .size(10.0),
-                                                            );
-                                                            ui.label(
-                                                                egui::RichText::new(format!(
-                                                                    "Last: {}",
-                                                                    dev.last_seen
-                                                                ))
-                                                                .color(tc.text_muted)
-                                                                .size(10.0),
-                                                            );
-                                                            ui.label(
-                                                                egui::RichText::new(format!(
-                                                                    "Seen {}x",
-                                                                    dev.times_seen
-                                                                ))
-                                                                .color(tc.teal)
-                                                                .size(10.0),
-                                                            );
-                                                        });
-                                                    });
-
-                                                // Click interaction
-                                                let click_resp = ui.interact(
-                                                    frame_resp.response.rect,
-                                                    egui::Id::new("known_click").with(kd_idx),
-                                                    egui::Sense::click(),
-                                                );
-                                                if click_resp.clicked() {
-                                                    if is_selected {
-                                                        selected_device = None;
-                                                    } else {
-                                                        selected_device = Some(dev.device_id.clone());
-                                                        nickname_buf = dev.nickname.clone().unwrap_or_default();
-                                                    }
-                                                }
-                                                if click_resp.hovered() {
-                                                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-                                                }
-
-                                                // Inline detail panel
-                                                if is_selected {
-                                                    let dev_si = storage_info.get(&dev.device_id)
-                                                        .or(dev.storage_info.as_ref());
-                                                    let vid_pid_opt = if dev.vid_pid.is_empty() { None } else { Some(dev.vid_pid.clone()) };
-                                                    draw_device_detail_panel(
-                                                        ui, &tc, &dev.device_id, &dev.name,
-                                                        vid_pid_opt, &dev.class,
-                                                        Some(dev.manufacturer.as_str()).filter(|s| !s.is_empty()),
-                                                        Some(dev.description.as_str()).filter(|s| !s.is_empty()),
-                                                        Some(dev), dev_si,
-                                                        &mut nickname_buf,
-                                                        &state_arc,
-                                                        dev.currently_connected,
-                                                    );
-                                                    // Check if forget was requested in detail panel
-                                                    // (handled inside draw_device_detail_panel via state_arc)
-                                                }
-                                            }
-
-                                            // Process forget action
-                                            if let Some(id) = forget_id {
-                                                if let Ok(mut s) = state_arc.lock() {
-                                                    s.known_devices.devices.remove(&id);
-                                                    save_cache(&s.known_devices);
-                                                }
-                                            }
-                                        }
-                                    });
-                            });
-                    }
+            .on_press(Message::OpenUrl(
+                "https://github.com/TrentSterling/device-history/releases/latest".to_string(),
+            ))
+            .padding([3, 8])
+            .style(move |_theme: &Theme, status| {
+                let bg = match status {
+                    button::Status::Hovered => blend_color(tc.bg_surface, tc.orange, 0.15),
+                    button::Status::Pressed => blend_color(tc.bg_surface, tc.orange, 0.25),
+                    _ => iced::Color::TRANSPARENT,
+                };
+                button::Style {
+                    background: Some(iced::Background::Color(bg)),
+                    border: iced::Border {
+                        color: tc.orange,
+                        width: 1.0,
+                        radius: 4.0.into(),
+                    },
+                    text_color: tc.orange,
+                    ..Default::default()
                 }
             });
-
-        // Write back changed values
-        if about_open != self.show_about {
-            self.show_about = about_open;
-            self.save_prefs();
+            header_row = header_row.push(update_btn);
         }
-        self.search_query = search_query;
-        self.sort_mode = sort_mode;
-        self.sort_ascending = sort_ascending;
-        self.selected_device = selected_device;
-        self.nickname_buf = nickname_buf;
+
+        header_row = header_row.push(horizontal_space());
+
+        // Theme buttons
+        for t in AppTheme::ALL {
+            let selected = self.app_theme == t;
+            let label_color = if selected { tc.accent } else { tc.text_sec };
+            let base_bg = if selected {
+                blend_color(tc.bg_elevated, tc.accent, 0.12)
+            } else {
+                iced::Color::TRANSPARENT
+            };
+            let border_color = if selected { tc.accent } else { tc.border };
+
+            let theme_btn = button(text(t.label()).size(11).color(label_color))
+                .on_press(Message::ThemeChanged(t))
+                .padding([3, 8])
+                .style(move |_theme: &Theme, status| {
+                    let bg = match status {
+                        button::Status::Hovered => blend_color(
+                            if selected { base_bg } else { tc.bg_elevated },
+                            tc.accent,
+                            0.18,
+                        ),
+                        button::Status::Pressed => blend_color(
+                            if selected { base_bg } else { tc.bg_elevated },
+                            tc.accent,
+                            0.28,
+                        ),
+                        _ => base_bg,
+                    };
+                    button::Style {
+                        background: Some(iced::Background::Color(bg)),
+                        border: iced::Border {
+                            color: border_color,
+                            width: if selected { 1.0 } else { 0.5 },
+                            radius: 3.0.into(),
+                        },
+                        text_color: label_color,
+                        ..Default::default()
+                    }
+                });
+            header_row = header_row.push(theme_btn);
+        }
+
+        // Status
+        header_row = header_row.push(Space::with_width(12));
+        if let Some(ref err) = self.error {
+            header_row = header_row.push(text(err).size(13).color(tc.pink));
+        } else {
+            header_row = header_row.push(
+                text(format!("\u{25CF} Monitoring {} devices", self.devices.len()))
+                    .size(13)
+                    .color(tc.teal),
+            );
+        }
+
+        let bg = tc.bg_surface;
+        let accent_hint = blend_color(tc.bg_surface, tc.accent, 0.05);
+        let border = tc.border;
+        container(header_row.width(Length::Fill))
+            .padding([10, 14])
+            .style(move |_theme: &Theme| container::Style {
+                background: Some(iced::Background::Gradient(iced::Gradient::Linear(
+                    iced::gradient::Linear::new(std::f32::consts::FRAC_PI_2)
+                        .add_stop(0.0, bg)
+                        .add_stop(1.0, accent_hint),
+                ))),
+                border: iced::Border {
+                    color: border,
+                    width: 1.0,
+                    radius: 0.0.into(),
+                },
+                ..Default::default()
+            })
+            .into()
+    }
+
+    fn view_tab_bar<'a>(
+        &'a self,
+        tc: &'a ThemeColors,
+        known_total: usize,
+        known_online: usize,
+    ) -> Element<'a, Message> {
+        let mut tab_row = Row::new().spacing(4).align_y(iced::Alignment::Center);
+
+        let tab_labels = [
+            (ActiveTab::Monitor, "Monitor"),
+            (ActiveTab::KnownDevices, "Known Devices"),
+        ];
+
+        for (tab, label) in tab_labels {
+            let selected = self.active_tab == tab;
+            let text_color = if selected { tc.accent } else { tc.text_sec };
+            let base_fill = if selected { tc.bg_deep } else { tc.bg_elevated };
+            let border_color = if selected { tc.accent } else { tc.border };
+
+            let tab_btn = button(text(label).size(13).color(text_color))
+                .on_press(Message::TabSelected(tab))
+                .padding([6, 14])
+                .style(move |_theme: &Theme, status| {
+                    let fill = match status {
+                        button::Status::Hovered => blend_color(base_fill, tc.accent, 0.12),
+                        button::Status::Pressed => blend_color(base_fill, tc.accent, 0.20),
+                        _ => base_fill,
+                    };
+                    button::Style {
+                        background: Some(iced::Background::Color(fill)),
+                        border: iced::Border {
+                            color: border_color,
+                            width: if selected { 1.0 } else { 0.5 },
+                            radius: 6.0.into(),
+                        },
+                        text_color,
+                        ..Default::default()
+                    }
+                });
+            tab_row = tab_row.push(tab_btn);
+        }
+
+        tab_row = tab_row.push(horizontal_space());
+        tab_row = tab_row.push(
+            text(format!("{} known ({} online)", known_total, known_online))
+                .size(12)
+                .color(tc.text_muted),
+        );
+
+        let bg = tc.bg_surface;
+        let border = tc.border;
+        container(tab_row.width(Length::Fill))
+            .padding(iced::Padding { top: 6.0, right: 14.0, bottom: 0.0, left: 14.0 })
+            .style(move |_theme: &Theme| container::Style {
+                background: Some(iced::Background::Color(bg)),
+                border: iced::Border {
+                    color: border,
+                    width: 0.5,
+                    radius: 0.0.into(),
+                },
+                ..Default::default()
+            })
+            .into()
+    }
+
+    fn view_footer<'a>(
+        &'a self,
+        tc: &'a ThemeColors,
+        known_total: usize,
+        known_online: usize,
+    ) -> Element<'a, Message> {
+        let footer_row = row![
+            text(format!("{} events logged", self.events.len()))
+                .size(12)
+                .color(tc.text_muted),
+            text("|").size(10).color(tc.accent),
+            text(format!("{} known ({} online)", known_total, known_online))
+                .size(12)
+                .color(tc.text_muted),
+            text("|").size(10).color(tc.accent),
+            text("Log: device-history.log")
+                .size(12)
+                .color(tc.text_muted),
+            horizontal_space(),
+            text("tront.xyz").size(11).color(tc.text_muted),
+        ]
+        .spacing(6)
+        .align_y(iced::Alignment::Center);
+
+        let bg = tc.bg_surface;
+        let border = tc.border;
+        container(footer_row.width(Length::Fill))
+            .padding([7, 14])
+            .style(move |_theme: &Theme| container::Style {
+                background: Some(iced::Background::Color(bg)),
+                border: iced::Border {
+                    color: border,
+                    width: 1.0,
+                    radius: 0.0.into(),
+                },
+                ..Default::default()
+            })
+            .into()
+    }
+
+    // ── Monitor Tab ────────────────────────────────────────────
+
+    fn view_monitor_tab<'a>(&'a self, tc: &'a ThemeColors) -> Element<'a, Message> {
+        let mut content = Column::new().spacing(8).padding(14);
+
+        // Compact about banner
+        content = content.push(self.view_about_banner(tc));
+
+        // Event log header
+        let clear_btn = button(text("\u{00D7} Clear").size(12).color(tc.orange))
+            .on_press(Message::ClearEvents)
+            .padding([2, 8])
+            .style(move |_theme: &Theme, status| {
+                let bg = match status {
+                    button::Status::Hovered => blend_color(tc.bg_surface, tc.orange, 0.15),
+                    button::Status::Pressed => blend_color(tc.bg_surface, tc.orange, 0.25),
+                    _ => iced::Color::TRANSPARENT,
+                };
+                button::Style {
+                    background: Some(iced::Background::Color(bg)),
+                    border: iced::Border {
+                        color: tc.orange,
+                        width: 1.0,
+                        radius: 4.0.into(),
+                    },
+                    text_color: tc.orange,
+                    ..Default::default()
+                }
+            });
+        let event_header = row![
+            text(format!(">Event Log ({})", self.events.len()))
+                .size(15)
+                .color(tc.cyan),
+            horizontal_space(),
+            clear_btn,
+        ]
+        .align_y(iced::Alignment::Center);
+        content = content.push(event_header);
+
+        // Event list
+        content = content.push(self.view_event_list(tc));
+
+        // Rainbow separator
+        content = content.push(rainbow_separator(tc));
+
+        // Connected devices header
+        content = content.push(
+            text(format!(">Connected ({})", self.devices.len()))
+                .size(15)
+                .color(tc.cyan),
+        );
+
+        // Connected devices list
+        content = content.push(self.view_connected_devices(tc));
+
+        let bg = tc.bg_deep;
+        container(content.width(Length::Fill).height(Length::Fill))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(move |_theme: &Theme| container::Style {
+                background: Some(iced::Background::Color(bg)),
+                ..Default::default()
+            })
+            .into()
+    }
+
+    fn view_about_banner<'a>(&'a self, tc: &'a ThemeColors) -> Element<'a, Message> {
+        let banner_row = row![
+            text(">WTF just disconnected?").size(13).color(tc.accent),
+            text("\u{2014}").size(11).color(tc.text_muted),
+            text("Real-time USB monitor").size(11).color(tc.text_sec),
+            text("|").size(10).color(tc.border),
+            text("\u{25CF} Live").size(10).color(tc.green),
+            text("\u{25CF} Log").size(10).color(tc.cyan),
+            text("\u{25CF} Cache").size(10).color(tc.yellow),
+            text("\u{25CF} CLI").size(10).color(tc.orange),
+        ]
+        .spacing(8)
+        .align_y(iced::Alignment::Center);
+
+        let bg_left = tc.bg_surface;
+        let bg_right = blend_color(tc.bg_surface, tc.accent, 0.06);
+        let border = tc.border;
+        container(banner_row)
+            .padding([6, 12])
+            .width(Length::Fill)
+            .style(move |_theme: &Theme| container::Style {
+                background: Some(iced::Background::Gradient(iced::Gradient::Linear(
+                    iced::gradient::Linear::new(std::f32::consts::FRAC_PI_2)
+                        .add_stop(0.0, bg_left)
+                        .add_stop(1.0, bg_right),
+                ))),
+                border: iced::Border {
+                    color: border,
+                    width: 0.5,
+                    radius: 6.0.into(),
+                },
+                ..Default::default()
+            })
+            .into()
+    }
+
+    fn view_event_list<'a>(&'a self, tc: &'a ThemeColors) -> Element<'a, Message> {
+        let mut event_col = Column::new().spacing(3);
+
+        if self.events.is_empty() {
+            event_col = event_col.push(
+                container(
+                    text("No events yet -- waiting for USB changes...")
+                        .size(13)
+                        .color(tc.text_sec),
+                )
+                .padding(16)
+                .width(Length::Fill)
+                .center_x(Length::Fill),
+            );
+        } else {
+            for event in &self.events {
+                event_col = event_col.push(self.view_event_card(tc, event));
+            }
+        }
+
+        let bg = tc.bg_surface;
+        let border = tc.border;
+        container(scrollable(event_col).height(Length::Fill))
+            .padding(iced::Padding { top: 6.0, right: 14.0, bottom: 6.0, left: 6.0 })
+            .width(Length::Fill)
+            .style(move |_theme: &Theme| container::Style {
+                background: Some(iced::Background::Color(bg)),
+                border: iced::Border {
+                    color: border,
+                    width: 1.0,
+                    radius: 6.0.into(),
+                },
+                ..Default::default()
+            })
+            .into()
+    }
+
+    fn view_event_card<'a>(&'a self, tc: &'a ThemeColors, event: &'a DeviceEvent) -> Element<'a, Message> {
+        let is_selected = self.selected_device.as_deref() == Some(&event.device_id);
+        let (accent, icon, label) = match event.kind {
+            EventKind::Connect => (tc.green, "\u{25B2}", "CONNECT"),
+            EventKind::Disconnect => (tc.red, "\u{25BC}", "DISCONNECT"),
+        };
+
+        let card_bg = if is_selected {
+            blend_color(tc.bg_elevated, tc.accent, 0.12)
+        } else {
+            blend_color(tc.bg_elevated, accent, 0.05)
+        };
+        let card_border = if is_selected { tc.accent } else { tc.border };
+
+        let mut card_row = Row::new()
+            .spacing(6)
+            .align_y(iced::Alignment::Center)
+            .push(text(&event.timestamp).size(12).color(tc.text_sec))
+            .push(
+                text(format!("{} {}", icon, label))
+                    .size(12)
+                    .color(accent),
+            )
+            .push(text(&event.name).size(12).color(tc.text));
+
+        if let Some(ref vp) = event.vid_pid {
+            card_row = card_row.push(text(format!("[{}]", vp)).size(11).color(tc.yellow));
+        }
+
+        // Drive letter badge
+        if let Some(si) = self.storage_info.get(&event.device_id) {
+            for vol in &si.volumes {
+                card_row = card_row.push(
+                    text(format!("[{}]", vol.drive_letter))
+                        .size(11)
+                        .color(tc.green),
+                );
+            }
+        }
+
+        card_row = card_row.push(text(&event.class).size(10).color(tc.accent));
+
+        if let Some(ref mfr) = event.manufacturer {
+            card_row = card_row.push(text(format!("({})", mfr)).size(11).color(tc.text_sec));
+        }
+
+        let dev_id = event.device_id.clone();
+        let card = button(
+            container(card_row)
+                .padding([4, 10])
+                .width(Length::Fill),
+        )
+        .on_press(if is_selected {
+            Message::SelectDevice(None)
+        } else {
+            Message::SelectDevice(Some(dev_id.clone()))
+        })
+        .padding(0)
+        .style(move |_theme: &Theme, status| {
+            let bg = match status {
+                button::Status::Hovered => blend_color(card_bg, tc.accent, 0.08),
+                button::Status::Pressed => blend_color(card_bg, tc.accent, 0.15),
+                _ => card_bg,
+            };
+            let bw = match status {
+                button::Status::Hovered => 1.0,
+                _ => if is_selected { 1.5 } else { 0.5 },
+            };
+            button::Style {
+                background: Some(iced::Background::Color(bg)),
+                border: iced::Border {
+                    color: card_border,
+                    width: bw,
+                    radius: 4.0.into(),
+                },
+                ..Default::default()
+            }
+        });
+
+        let mut col = Column::new().push(card);
+        if is_selected {
+            col = col.push(self.view_detail_panel(tc, &event.device_id, true));
+        }
+        col.into()
+    }
+
+    fn view_connected_devices<'a>(&'a self, tc: &'a ThemeColors) -> Element<'a, Message> {
+        let mut dev_col = Column::new().spacing(2);
+
+        if self.devices.is_empty() {
+            dev_col = dev_col.push(
+                container(
+                    text("No devices connected")
+                        .size(13)
+                        .color(tc.text_sec),
+                )
+                .padding(16)
+                .width(Length::Fill)
+                .center_x(Length::Fill),
+            );
+        } else {
+            for (dev_id, dev) in &self.devices {
+                dev_col = dev_col.push(self.view_connected_device_card(tc, dev_id, dev));
+            }
+        }
+
+        let bg = tc.bg_surface;
+        let border = tc.border;
+        container(scrollable(dev_col).height(Length::Fill))
+            .padding(iced::Padding { top: 6.0, right: 14.0, bottom: 6.0, left: 6.0 })
+            .width(Length::Fill)
+            .style(move |_theme: &Theme| container::Style {
+                background: Some(iced::Background::Color(bg)),
+                border: iced::Border {
+                    color: border,
+                    width: 1.0,
+                    radius: 6.0.into(),
+                },
+                ..Default::default()
+            })
+            .into()
+    }
+
+    fn view_connected_device_card<'a>(
+        &'a self,
+        tc: &'a ThemeColors,
+        dev_id: &'a str,
+        dev: &'a UsbDevice,
+    ) -> Element<'a, Message> {
+        let is_selected = self.selected_device.as_deref() == Some(dev_id);
+        let card_bg = if is_selected {
+            blend_color(tc.bg_elevated, tc.accent, 0.12)
+        } else {
+            tc.bg_elevated
+        };
+        let card_border = if is_selected { tc.accent } else { tc.border };
+
+        let conn_si = self.storage_info.get(dev_id);
+        let mut card_row = Row::new()
+            .spacing(6)
+            .align_y(iced::Alignment::Center);
+
+        if let Some(si) = conn_si {
+            for vol in &si.volumes {
+                card_row = card_row.push(
+                    text(&vol.drive_letter)
+                        .size(13)
+                        .color(tc.green),
+                );
+                if !vol.volume_name.is_empty() {
+                    card_row = card_row.push(
+                        text(format!("\"{}\"", vol.volume_name))
+                            .size(12)
+                            .color(tc.text),
+                    );
+                }
+            }
+            if !si.model.is_empty() {
+                card_row = card_row.push(text(&si.model).size(11).color(tc.text_sec));
+            }
+        } else {
+            card_row = card_row.push(text(dev.class()).size(11).color(tc.accent));
+            card_row = card_row.push(text(dev.display_name()).size(12).color(tc.text));
+        }
+
+        // Nickname
+        if let Some(kd) = self.known_devices.devices.get(dev_id) {
+            if let Some(ref nick) = kd.nickname {
+                if !nick.is_empty() {
+                    card_row =
+                        card_row.push(text(format!("({})", nick)).size(11).color(tc.teal));
+                }
+            }
+        }
+
+        if let Some(vp) = dev.vid_pid() {
+            card_row = card_row.push(text(format!("[{}]", vp)).size(10).color(tc.yellow));
+        }
+
+        if conn_si.is_none() {
+            if let Some(ref mfr) = dev.Manufacturer {
+                card_row = card_row.push(text(mfr).size(10).color(tc.text_sec));
+            }
+        }
+
+        let dev_id_string = dev_id.to_string();
+        let card = button(
+            container(card_row)
+                .padding([4, 10])
+                .width(Length::Fill),
+        )
+        .on_press(if is_selected {
+            Message::SelectDevice(None)
+        } else {
+            Message::SelectDevice(Some(dev_id_string))
+        })
+        .padding(0)
+        .style(move |_theme: &Theme, status| {
+            let bg = match status {
+                button::Status::Hovered => blend_color(card_bg, tc.accent, 0.08),
+                button::Status::Pressed => blend_color(card_bg, tc.accent, 0.15),
+                _ => card_bg,
+            };
+            let bw = match status {
+                button::Status::Hovered => 1.0,
+                _ => if is_selected { 1.5 } else { 0.5 },
+            };
+            button::Style {
+                background: Some(iced::Background::Color(bg)),
+                border: iced::Border {
+                    color: card_border,
+                    width: bw,
+                    radius: 4.0.into(),
+                },
+                ..Default::default()
+            }
+        });
+
+        let mut col = Column::new().push(card);
+        if is_selected {
+            col = col.push(self.view_detail_panel(tc, dev_id, true));
+        }
+        col.into()
+    }
+
+    // ── Known Devices Tab ──────────────────────────────────────
+
+    fn view_known_devices_tab<'a>(&'a self, tc: &'a ThemeColors) -> Element<'a, Message> {
+        let mut content = Column::new().spacing(6).padding(14);
+
+        // Search + sort bar
+        let search_input = text_input("Search by name, class, manufacturer, VID:PID...", &self.search_query)
+            .on_input(Message::SearchChanged)
+            .width(300)
+            .size(13);
+
+        let mut sort_row = Row::new().spacing(4).align_y(iced::Alignment::Center);
+        sort_row = sort_row
+            .push(text(">").size(14).color(tc.text_sec))
+            .push(search_input);
+
+        // Search clear (X) button
+        if !self.search_query.is_empty() {
+            let clear_btn = button(text("\u{2715}").size(14).color(tc.text_sec))
+                .on_press(Message::SearchChanged(String::new()))
+                .padding([2, 6])
+                .style(move |_theme: &Theme, status| {
+                    let bg = match status {
+                        button::Status::Hovered => blend_color(tc.bg_surface, tc.red, 0.15),
+                        button::Status::Pressed => blend_color(tc.bg_surface, tc.red, 0.25),
+                        _ => iced::Color::TRANSPARENT,
+                    };
+                    button::Style {
+                        background: Some(iced::Background::Color(bg)),
+                        border: iced::Border {
+                            color: iced::Color::TRANSPARENT,
+                            width: 0.0,
+                            radius: 3.0.into(),
+                        },
+                        text_color: tc.text_sec,
+                        ..Default::default()
+                    }
+                });
+            sort_row = sort_row.push(clear_btn);
+        }
+
+        sort_row = sort_row.push(Space::with_width(12));
+
+        for mode in SortMode::ALL {
+            let selected = self.sort_mode == mode;
+            let arrow = if selected {
+                if self.sort_ascending { " \u{25B2}" } else { " \u{25BC}" }
+            } else {
+                ""
+            };
+            let label_color = if selected { tc.accent } else { tc.text_sec };
+            let base_bg = if selected {
+                blend_color(tc.bg_elevated, tc.accent, 0.12)
+            } else {
+                iced::Color::TRANSPARENT
+            };
+            let border_color = if selected { tc.accent } else { tc.border };
+
+            let sort_btn = button(
+                text(format!("{}{}", mode.label(), arrow))
+                    .size(11)
+                    .color(label_color),
+            )
+            .on_press(Message::SortBy(mode))
+            .padding([3, 8])
+            .style(move |_theme: &Theme, status| {
+                let bg = match status {
+                    button::Status::Hovered => blend_color(
+                        if selected { base_bg } else { tc.bg_elevated },
+                        tc.accent,
+                        0.18,
+                    ),
+                    button::Status::Pressed => blend_color(
+                        if selected { base_bg } else { tc.bg_elevated },
+                        tc.accent,
+                        0.28,
+                    ),
+                    _ => base_bg,
+                };
+                button::Style {
+                    background: Some(iced::Background::Color(bg)),
+                    border: iced::Border {
+                        color: border_color,
+                        width: if selected { 1.0 } else { 0.5 },
+                        radius: 3.0.into(),
+                    },
+                    text_color: label_color,
+                    ..Default::default()
+                }
+            });
+            sort_row = sort_row.push(sort_btn);
+        }
+
+        content = content.push(sort_row);
+
+        // Filter + sort devices
+        let query_lower = self.search_query.to_lowercase();
+        let mut filtered: Vec<&KnownDevice> = self
+            .known_devices
+            .devices
+            .values()
+            .filter(|d| {
+                if query_lower.is_empty() {
+                    return true;
+                }
+                d.name.to_lowercase().contains(&query_lower)
+                    || d.device_id.to_lowercase().contains(&query_lower)
+                    || d.class.to_lowercase().contains(&query_lower)
+                    || d.manufacturer.to_lowercase().contains(&query_lower)
+                    || d.vid_pid.to_lowercase().contains(&query_lower)
+                    || d.nickname
+                        .as_deref()
+                        .unwrap_or("")
+                        .to_lowercase()
+                        .contains(&query_lower)
+            })
+            .collect();
+
+        let sort_mode = self.sort_mode;
+        let sort_ascending = self.sort_ascending;
+        filtered.sort_by(|a, b| {
+            let cmp = match sort_mode {
+                SortMode::Status => a
+                    .currently_connected
+                    .cmp(&b.currently_connected)
+                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+                SortMode::Name => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                SortMode::LastSeen => a
+                    .last_seen
+                    .cmp(&b.last_seen)
+                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+                SortMode::TimesSeen => a
+                    .times_seen
+                    .cmp(&b.times_seen)
+                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+                SortMode::FirstSeen => a
+                    .first_seen
+                    .cmp(&b.first_seen)
+                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+            };
+            if sort_ascending {
+                cmp
+            } else {
+                cmp.reverse()
+            }
+        });
+
+        // Device cards
+        let mut dev_col = Column::new().spacing(3);
+
+        if self.known_devices.devices.is_empty() {
+            dev_col = dev_col.push(
+                container(
+                    text("No devices seen yet -- plug in a USB device to get started")
+                        .size(13)
+                        .color(tc.text_sec),
+                )
+                .padding(24)
+                .width(Length::Fill)
+                .center_x(Length::Fill),
+            );
+        } else if filtered.is_empty() {
+            dev_col = dev_col.push(
+                container(
+                    text(format!("No devices matching '{}'", self.search_query))
+                        .size(13)
+                        .color(tc.text_sec),
+                )
+                .padding(24)
+                .width(Length::Fill)
+                .center_x(Length::Fill),
+            );
+        } else {
+            for dev in &filtered {
+                dev_col = dev_col.push(self.view_known_device_card(tc, dev));
+            }
+        }
+
+        let bg = tc.bg_surface;
+        let border = tc.border;
+        let devices_container = container(scrollable(dev_col).height(Length::Fill))
+            .padding(iced::Padding { top: 6.0, right: 14.0, bottom: 6.0, left: 6.0 })
+            .width(Length::Fill)
+            .style(move |_theme: &Theme| container::Style {
+                background: Some(iced::Background::Color(bg)),
+                border: iced::Border {
+                    color: border,
+                    width: 1.0,
+                    radius: 6.0.into(),
+                },
+                ..Default::default()
+            });
+
+        content = content.push(devices_container);
+
+        let bg = tc.bg_deep;
+        container(content)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(move |_theme: &Theme| container::Style {
+                background: Some(iced::Background::Color(bg)),
+                ..Default::default()
+            })
+            .into()
+    }
+
+    fn view_known_device_card<'a>(&'a self, tc: &'a ThemeColors, dev: &'a KnownDevice) -> Element<'a, Message> {
+        let is_selected = self.selected_device.as_deref() == Some(&dev.device_id);
+
+        let card_bg = if is_selected {
+            blend_color(tc.bg_elevated, tc.accent, 0.10)
+        } else if dev.currently_connected {
+            blend_color(tc.bg_elevated, tc.green, 0.06)
+        } else {
+            tc.bg_elevated
+        };
+        let card_border = if is_selected { tc.accent } else { tc.border };
+
+        let dot_color = if dev.currently_connected {
+            tc.green
+        } else {
+            tc.text_muted
+        };
+
+        let dev_si = self
+            .storage_info
+            .get(&dev.device_id)
+            .or(dev.storage_info.as_ref());
+
+        // Row 1
+        let mut row1 = Row::new()
+            .spacing(6)
+            .align_y(iced::Alignment::Center)
+            .push(text("\u{25CF}").size(10).color(dot_color));
+
+        if let Some(si) = dev_si {
+            for vol in &si.volumes {
+                row1 = row1.push(text(&vol.drive_letter).size(13).color(tc.green));
+                if !vol.volume_name.is_empty() {
+                    row1 = row1.push(
+                        text(format!("\"{}\"", vol.volume_name))
+                            .size(12)
+                            .color(tc.text),
+                    );
+                }
+            }
+            if !si.model.is_empty() {
+                row1 = row1.push(text(&si.model).size(11).color(tc.text_sec));
+            }
+        } else {
+            row1 = row1.push(text(&dev.class).size(11).color(tc.accent));
+            row1 = row1.push(text(&dev.name).size(12).color(tc.text));
+        }
+
+        if let Some(ref nick) = dev.nickname {
+            if !nick.is_empty() {
+                row1 = row1.push(text(format!("({})", nick)).size(11).color(tc.teal));
+            }
+        }
+        if !dev.vid_pid.is_empty() {
+            row1 = row1.push(text(format!("[{}]", dev.vid_pid)).size(10).color(tc.yellow));
+        }
+        if dev_si.is_none() && !dev.manufacturer.is_empty() {
+            row1 = row1.push(text(&dev.manufacturer).size(10).color(tc.text_sec));
+        }
+
+        // Row 2: timestamps
+        let row2 = row![
+            text(format!("First: {}", dev.first_seen))
+                .size(10)
+                .color(tc.text_muted),
+            text(format!("Last: {}", dev.last_seen))
+                .size(10)
+                .color(tc.text_muted),
+            text(format!("{}x", dev.times_seen))
+                .size(10)
+                .color(tc.teal),
+        ]
+        .spacing(12);
+
+        let card_content = column![row1, row2].spacing(2);
+
+        let card = button(
+            container(card_content)
+                .padding([5, 10])
+                .width(Length::Fill),
+        )
+        .on_press(if is_selected {
+            Message::SelectDevice(None)
+        } else {
+            Message::SelectDevice(Some(dev.device_id.clone()))
+        })
+        .padding(0)
+        .style(move |_theme: &Theme, status| {
+            let bg = match status {
+                button::Status::Hovered => blend_color(card_bg, tc.accent, 0.08),
+                button::Status::Pressed => blend_color(card_bg, tc.accent, 0.15),
+                _ => card_bg,
+            };
+            let bw = match status {
+                button::Status::Hovered => 1.0,
+                _ => if is_selected { 1.5 } else { 0.5 },
+            };
+            button::Style {
+                background: Some(iced::Background::Color(bg)),
+                border: iced::Border {
+                    color: card_border,
+                    width: bw,
+                    radius: 4.0.into(),
+                },
+                ..Default::default()
+            }
+        });
+
+        let mut col = Column::new().push(card);
+        if is_selected {
+            col = col.push(self.view_detail_panel(tc, &dev.device_id, dev.currently_connected));
+        }
+        col.into()
+    }
+
+    // ── Detail Panel ───────────────────────────────────────────
+
+    fn view_detail_panel<'a>(
+        &'a self,
+        tc: &'a ThemeColors,
+        device_id: &'a str,
+        is_connected: bool,
+    ) -> Element<'a, Message> {
+        let kd = self.known_devices.devices.get(device_id);
+        let si = self
+            .storage_info
+            .get(device_id)
+            .or_else(|| kd.and_then(|k| k.storage_info.as_ref()));
+
+        let mut content = Column::new().spacing(4);
+
+        // Storage headline
+        if let Some(si) = si {
+            for vol in &si.volumes {
+                let mut vol_row = Row::new()
+                    .spacing(8)
+                    .align_y(iced::Alignment::Center)
+                    .push(text(&vol.drive_letter).size(20).color(tc.green));
+                if !vol.volume_name.is_empty() {
+                    vol_row = vol_row.push(
+                        text(format!("\"{}\"", vol.volume_name))
+                            .size(16)
+                            .color(tc.text),
+                    );
+                }
+                vol_row = vol_row.push(
+                    text(format!("({})", vol.file_system))
+                        .size(12)
+                        .color(tc.text_sec),
+                );
+                content = content.push(vol_row);
+
+                // Capacity bar (progress_bar + text)
+                if vol.total_bytes > 0 {
+                    let free_str = format_bytes(vol.free_bytes);
+                    let total_str = format_bytes(vol.total_bytes);
+                    let used_pct =
+                        (1.0 - (vol.free_bytes as f64 / vol.total_bytes as f64)) * 100.0;
+                    let bar_color = if used_pct < 70.0 {
+                        tc.green
+                    } else if used_pct < 90.0 {
+                        tc.yellow
+                    } else {
+                        tc.red
+                    };
+                    let bar_bg = tc.bg_elevated;
+                    content = content.push(
+                        progress_bar(0.0..=100.0, used_pct as f32)
+                            .height(12)
+                            .style(move |_theme: &Theme| {
+                                iced::widget::progress_bar::Style {
+                                    background: iced::Background::Color(bar_bg),
+                                    bar: iced::Background::Color(bar_color),
+                                    border: iced::Border {
+                                        color: iced::Color::TRANSPARENT,
+                                        width: 0.0,
+                                        radius: 3.0.into(),
+                                    },
+                                }
+                            }),
+                    );
+                    content = content.push(
+                        text(format!(
+                            "{} free / {}  ({:.0}% used)",
+                            free_str, total_str, used_pct
+                        ))
+                        .size(11)
+                        .color(bar_color),
+                    );
+                }
+            }
+
+            // Model + serial
+            let mut model_row = Row::new().spacing(6);
+            model_row = model_row.push(text(&si.model).size(12).color(tc.text));
+            if !si.serial_number.is_empty() {
+                model_row = model_row.push(
+                    text(format!("({})", si.serial_number))
+                        .size(11)
+                        .color(tc.text_sec),
+                );
+            }
+            content = content.push(model_row);
+
+            if !is_connected {
+                content = content.push(
+                    text("OFFLINE -- showing last known info")
+                        .size(10)
+                        .color(tc.orange),
+                );
+            }
+
+            content = content.push(horizontal_rule(1));
+
+            // Technical details
+            let detail_rows = [
+                ("Interface:", si.interface_type.as_str()),
+                ("Firmware:", si.firmware.as_str()),
+                ("Status:", si.status.as_str()),
+            ];
+            for (label, value) in &detail_rows {
+                if !value.is_empty() {
+                    content = content.push(
+                        row![
+                            text(*label).size(11).color(tc.text_sec),
+                            text(*value).size(11).color(tc.text),
+                        ]
+                        .spacing(6),
+                    );
+                }
+            }
+            content = content.push(horizontal_rule(1));
+        } else if let Some(kd) = kd {
+            content = content.push(text(&kd.name).size(14).color(tc.text));
+        }
+
+        // Nickname editing
+        let nickname_row = row![
+            text("Nickname:").size(11).color(tc.text_sec),
+            text_input("e.g. My 4TB Seagate", &self.nickname_buf)
+                .on_input(Message::NicknameChanged)
+                .width(200)
+                .size(12),
+            button(text("Save").size(11).color(tc.teal))
+                .on_press(Message::SaveNickname)
+                .padding([2, 8])
+                .style(move |_theme: &Theme, status| {
+                    let bg = match status {
+                        button::Status::Hovered => blend_color(tc.bg_surface, tc.teal, 0.15),
+                        button::Status::Pressed => blend_color(tc.bg_surface, tc.teal, 0.25),
+                        _ => iced::Color::TRANSPARENT,
+                    };
+                    button::Style {
+                        background: Some(iced::Background::Color(bg)),
+                        border: iced::Border {
+                            color: tc.teal,
+                            width: 0.5,
+                            radius: 3.0.into(),
+                        },
+                        text_color: tc.teal,
+                        ..Default::default()
+                    }
+                }),
+        ]
+        .spacing(6)
+        .align_y(iced::Alignment::Center);
+        content = content.push(nickname_row);
+
+        // Device info section
+        content = content.push(Space::with_height(4));
+        content = content.push(text(">DEVICE INFO").size(12).color(tc.cyan));
+
+        if let Some(kd) = kd {
+            let info_rows = [
+                ("Device ID:", kd.device_id.as_str()),
+                (
+                    "VID:PID:",
+                    if kd.vid_pid.is_empty() {
+                        "-"
+                    } else {
+                        &kd.vid_pid
+                    },
+                ),
+                ("Class:", &kd.class),
+                (
+                    "Manufacturer:",
+                    if kd.manufacturer.is_empty() {
+                        "-"
+                    } else {
+                        &kd.manufacturer
+                    },
+                ),
+                (
+                    "Description:",
+                    if kd.description.is_empty() {
+                        "-"
+                    } else {
+                        &kd.description
+                    },
+                ),
+            ];
+            for (label, value) in &info_rows {
+                content = content.push(
+                    row![
+                        text(*label).size(11).color(tc.text_sec),
+                        text(*value).size(11).color(tc.text),
+                    ]
+                    .spacing(6),
+                );
+            }
+
+            // History
+            content = content.push(horizontal_rule(1));
+            content = content.push(text(">HISTORY").size(12).color(tc.cyan));
+            content = content.push(
+                row![
+                    text(format!("First seen: {}", kd.first_seen))
+                        .size(11)
+                        .color(tc.text_sec),
+                    text(format!("Last seen: {}", kd.last_seen))
+                        .size(11)
+                        .color(tc.text_sec),
+                    text(format!("Times seen: {}x", kd.times_seen))
+                        .size(11)
+                        .color(tc.teal),
+                ]
+                .spacing(16),
+            );
+        }
+
+        // Action buttons
+        content = content.push(horizontal_rule(1));
+
+        let dev_id_for_copy = device_id.to_string();
+        let dev_id_for_forget = device_id.to_string();
+
+        let mut action_row = Row::new().spacing(8);
+        action_row = action_row.push(
+            button(text("Copy ID").size(11).color(tc.text_sec))
+                .on_press(Message::CopyToClipboard(dev_id_for_copy))
+                .padding([2, 8])
+                .style(move |_theme: &Theme, status| {
+                    let bg = match status {
+                        button::Status::Hovered => blend_color(tc.bg_surface, tc.accent, 0.15),
+                        button::Status::Pressed => blend_color(tc.bg_surface, tc.accent, 0.25),
+                        _ => iced::Color::TRANSPARENT,
+                    };
+                    button::Style {
+                        background: Some(iced::Background::Color(bg)),
+                        border: iced::Border {
+                            color: tc.border,
+                            width: 0.5,
+                            radius: 3.0.into(),
+                        },
+                        text_color: tc.text_sec,
+                        ..Default::default()
+                    }
+                }),
+        );
+
+        if let Some(si) = si {
+            if !si.serial_number.is_empty() {
+                let serial = si.serial_number.clone();
+                action_row = action_row.push(
+                    button(text("Copy Serial").size(11).color(tc.text_sec))
+                        .on_press(Message::CopyToClipboard(serial))
+                        .padding([2, 8])
+                        .style(move |_theme: &Theme, status| {
+                            let bg = match status {
+                                button::Status::Hovered => {
+                                    blend_color(tc.bg_surface, tc.accent, 0.15)
+                                }
+                                button::Status::Pressed => {
+                                    blend_color(tc.bg_surface, tc.accent, 0.25)
+                                }
+                                _ => iced::Color::TRANSPARENT,
+                            };
+                            button::Style {
+                                background: Some(iced::Background::Color(bg)),
+                                border: iced::Border {
+                                    color: tc.border,
+                                    width: 0.5,
+                                    radius: 3.0.into(),
+                                },
+                                text_color: tc.text_sec,
+                                ..Default::default()
+                            }
+                        }),
+                );
+            }
+        }
+
+        action_row = action_row.push(
+            button(text("\u{00D7} Forget").size(11).color(tc.red))
+                .on_press(Message::ForgetDevice(dev_id_for_forget))
+                .padding([2, 8])
+                .style(move |_theme: &Theme, status| {
+                    let bg = match status {
+                        button::Status::Hovered => blend_color(tc.bg_surface, tc.red, 0.15),
+                        button::Status::Pressed => blend_color(tc.bg_surface, tc.red, 0.25),
+                        _ => iced::Color::TRANSPARENT,
+                    };
+                    button::Style {
+                        background: Some(iced::Background::Color(bg)),
+                        border: iced::Border {
+                            color: tc.red,
+                            width: 0.5,
+                            radius: 3.0.into(),
+                        },
+                        text_color: tc.red,
+                        ..Default::default()
+                    }
+                }),
+        );
+
+        content = content.push(action_row);
+
+        let panel_bg = blend_color(tc.bg_surface, tc.accent, 0.03);
+        let panel_border = blend_color(tc.border, tc.accent, 0.3);
+        container(content)
+            .padding(12)
+            .width(Length::Fill)
+            .style(move |_theme: &Theme| container::Style {
+                background: Some(iced::Background::Color(panel_bg)),
+                border: iced::Border {
+                    color: panel_border,
+                    width: 1.0,
+                    radius: 6.0.into(),
+                },
+                ..Default::default()
+            })
+            .into()
+    }
+}
+
+// ── Helpers ────────────────────────────────────────────────────
+
+fn rainbow_separator<'a>(tc: &ThemeColors) -> Element<'a, Message> {
+    let colors = [tc.red, tc.orange, tc.yellow, tc.green, tc.teal, tc.cyan, tc.accent, tc.pink];
+    let mut rainbow_row = Row::new();
+    for c in colors {
+        rainbow_row = rainbow_row.push(
+            container(Space::new(Length::Fill, 2))
+                .width(Length::Fill)
+                .style(move |_theme: &Theme| container::Style {
+                    background: Some(iced::Background::Color(c)),
+                    ..Default::default()
+                }),
+        );
+    }
+    rainbow_row.height(2).into()
+}
+
+fn blend_color(base: iced::Color, target: iced::Color, t: f32) -> iced::Color {
+    iced::Color {
+        r: base.r * (1.0 - t) + target.r * t,
+        g: base.g * (1.0 - t) + target.g * t,
+        b: base.b * (1.0 - t) + target.b * t,
+        a: 1.0,
+    }
+}
+
+async fn check_for_updates() -> Option<String> {
+    let current = env!("CARGO_PKG_VERSION");
+    let resp = ureq::get(
+        "https://api.github.com/repos/TrentSterling/device-history/releases/latest",
+    )
+    .set("User-Agent", "device-history")
+    .call()
+    .ok()?;
+    let body = resp.into_string().ok()?;
+    let start = body.find("\"tag_name\"")?;
+    let rest = &body[start..];
+    let colon = rest.find(':')?;
+    let after_colon = rest[colon + 1..].trim_start();
+    if !after_colon.starts_with('"') {
+        return None;
+    }
+    let val_end = after_colon[1..].find('"')?;
+    let tag = &after_colon[1..1 + val_end];
+    let latest = tag.trim_start_matches('v');
+    if latest != current {
+        Some(latest.to_string())
+    } else {
+        None
     }
 }
 
 // ── CLI mode ───────────────────────────────────────────────────
 
 fn run_cli() {
-    // Attach to parent console (or allocate one) when windows_subsystem = "windows"
     #[cfg(windows)]
     unsafe {
         extern "system" {
@@ -2781,21 +2813,6 @@ fn main() {
         return;
     }
 
-    let cache = load_cache();
-
-    let state = Arc::new(Mutex::new(AppState {
-        devices: Vec::new(),
-        events: Vec::new(),
-        error: None,
-        known_devices: cache,
-        storage_info: HashMap::new(),
-    }));
-
-    let state_bg = state.clone();
-    thread::spawn(move || monitor_loop(state_bg));
-
-    let icon = load_icon();
-
     // ── Tray icon setup ──
     let show_item = MenuItem::new("Show", true, None);
     let hide_item = MenuItem::new("Hide", true, None);
@@ -2829,55 +2846,64 @@ fn main() {
         .build()
         .expect("Failed to create tray icon");
 
-    let mut viewport = egui::ViewportBuilder::default()
-        .with_inner_size([720.0, 620.0])
-        .with_min_inner_size([420.0, 340.0])
-        .with_title("Device History");
+    // ── Monitor thread ──
+    let (monitor_tx, monitor_rx) = mpsc::channel();
+    thread::spawn(move || monitor_loop(monitor_tx));
 
-    if let Some(icon_data) = icon {
-        viewport = viewport.with_icon(std::sync::Arc::new(icon_data));
-    }
+    // ── Tray event thread ──
+    let (tray_tx, tray_rx) = mpsc::channel();
+    let show_id = tray_menu_ids.show.clone();
+    let hide_id = tray_menu_ids.hide.clone();
+    let exit_id = tray_menu_ids.exit.clone();
+    thread::spawn(move || loop {
+        thread::sleep(Duration::from_millis(100));
 
-    let options = eframe::NativeOptions {
-        viewport,
-        ..Default::default()
+        if let Ok(event) = MenuEvent::receiver().try_recv() {
+            if event.id == show_id {
+                let _ = tray_tx.send(TrayAction::Show);
+            } else if event.id == hide_id {
+                let _ = tray_tx.send(TrayAction::Hide);
+            } else if event.id == exit_id {
+                let _ = tray_tx.send(TrayAction::Exit);
+            }
+        }
+
+        if let Ok(TrayIconEvent::DoubleClick { .. }) = TrayIconEvent::receiver().try_recv() {
+            let _ = tray_tx.send(TrayAction::Show);
+        }
+    });
+
+    // ── Window icon ──
+    let window_icon = {
+        let png_bytes = include_bytes!("../assets/icon.png");
+        let img = image::load_from_memory(png_bytes)
+            .expect("Failed to load window icon")
+            .into_rgba8();
+        let (w, h) = img.dimensions();
+        iced::window::icon::from_rgba(img.into_raw(), w, h).ok()
     };
 
-    if let Err(e) = eframe::run_native(
-        "Device History",
-        options,
-        Box::new(move |cc| {
-            // Tray event thread — handles show/hide/exit independently of eframe's render loop.
-            // eframe may skip update() for hidden windows, so we poll tray events here instead.
-            let ctx = cc.egui_ctx.clone();
-            let show_id = tray_menu_ids.show.clone();
-            let hide_id = tray_menu_ids.hide.clone();
-            let exit_id = tray_menu_ids.exit.clone();
-            thread::spawn(move || loop {
-                thread::sleep(Duration::from_millis(100));
+    // ── Launch Iced ──
+    let mut app = iced::application(
+        DeviceHistoryApp::title,
+        DeviceHistoryApp::update,
+        DeviceHistoryApp::view,
+    )
+    .subscription(DeviceHistoryApp::subscription)
+    .theme(DeviceHistoryApp::theme)
+    .window_size((720.0, 620.0));
 
-                if let Ok(event) = MenuEvent::receiver().try_recv() {
-                    if event.id == show_id {
-                        #[cfg(windows)]
-                        win32::show_window();
-                        ctx.request_repaint();
-                    } else if event.id == hide_id {
-                        #[cfg(windows)]
-                        win32::hide_window();
-                    } else if event.id == exit_id {
-                        std::process::exit(0);
-                    }
-                }
+    if let Some(icon) = window_icon {
+        app = app.window(iced::window::Settings {
+            icon: Some(icon),
+            min_size: Some((420.0, 340.0).into()),
+            ..Default::default()
+        });
+    }
 
-                if let Ok(TrayIconEvent::DoubleClick { .. }) = TrayIconEvent::receiver().try_recv() {
-                    #[cfg(windows)]
-                    win32::show_window();
-                    ctx.request_repaint();
-                }
-            });
-            Ok(Box::new(DeviceHistoryApp::new(state, tray_menu_ids)))
-        }),
-    ) {
+    let result = app.run_with(move || DeviceHistoryApp::new(monitor_rx, tray_menu_ids, tray_rx));
+
+    if let Err(e) = result {
         eprintln!("GUI error: {}", e);
     }
 }

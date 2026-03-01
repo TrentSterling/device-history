@@ -1,0 +1,216 @@
+import { listen } from "@tauri-apps/api/event";
+import * as cmd from "../commands";
+import type {
+  AppSnapshot,
+  DeviceEvent,
+  DeviceSnapshot,
+  KnownDevice,
+  StorageInfo,
+} from "../types";
+
+export type SortMode = "status" | "name" | "last_seen" | "times_seen" | "first_seen";
+
+class AppState {
+  // Data
+  devices = $state<DeviceSnapshot[]>([]);
+  events = $state<DeviceEvent[]>([]);
+  knownDevices = $state<Record<string, KnownDevice>>({});
+  storageInfo = $state<Record<string, StorageInfo>>({});
+  error = $state<string | null>(null);
+
+  // UI state
+  theme = $state("neon");
+  activeTab = $state<"monitor" | "known">("monitor");
+  searchQuery = $state("");
+  sortMode = $state<SortMode>("status");
+  sortAscending = $state(true);
+  selectedDevice = $state<string | null>(null);
+  nicknameBuf = $state("");
+
+  // System
+  updateAvailable = $state<string | null>(null);
+
+  // Notifications
+  notifications = $state<{ id: number; text: string; kind: string }[]>([]);
+  private nextNotifId = 0;
+
+  // Derived: filtered + sorted known devices
+  get filteredKnown(): KnownDevice[] {
+    const q = this.searchQuery.toLowerCase();
+    let list = Object.values(this.knownDevices);
+
+    if (q) {
+      list = list.filter(
+        (d) =>
+          d.name.toLowerCase().includes(q) ||
+          d.device_id.toLowerCase().includes(q) ||
+          d.class.toLowerCase().includes(q) ||
+          d.manufacturer.toLowerCase().includes(q) ||
+          d.vid_pid.toLowerCase().includes(q) ||
+          (d.nickname ?? "").toLowerCase().includes(q)
+      );
+    }
+
+    const mode = this.sortMode;
+    const asc = this.sortAscending;
+    list.sort((a, b) => {
+      let cmp = 0;
+      switch (mode) {
+        case "status":
+          cmp = Number(a.currently_connected) - Number(b.currently_connected);
+          if (cmp === 0)
+            cmp = a.name.toLowerCase().localeCompare(b.name.toLowerCase());
+          break;
+        case "name":
+          cmp = a.name.toLowerCase().localeCompare(b.name.toLowerCase());
+          break;
+        case "last_seen":
+          cmp = a.last_seen.localeCompare(b.last_seen);
+          break;
+        case "times_seen":
+          cmp = a.times_seen - b.times_seen;
+          break;
+        case "first_seen":
+          cmp = a.first_seen.localeCompare(b.first_seen);
+          break;
+      }
+      return asc ? cmp : -cmp;
+    });
+
+    return list;
+  }
+
+  get knownTotal(): number {
+    return Object.keys(this.knownDevices).length;
+  }
+
+  get knownOnline(): number {
+    return Object.values(this.knownDevices).filter((d) => d.currently_connected)
+      .length;
+  }
+
+  async init() {
+    // Load initial snapshot
+    try {
+      const snap = await cmd.getSnapshot();
+      this.applySnapshot(snap);
+    } catch (e) {
+      console.error("Failed to get initial snapshot:", e);
+    }
+
+    // Load prefs
+    try {
+      const prefs = await cmd.getPrefs();
+      this.theme = prefs.theme || "neon";
+      this.activeTab = prefs.active_tab === "known" ? "known" : "monitor";
+    } catch (e) {
+      console.error("Failed to load prefs:", e);
+    }
+
+    // Check for updates
+    try {
+      const ver = await cmd.checkForUpdates();
+      this.updateAvailable = ver;
+    } catch {
+      // Silently ignore
+    }
+
+    // Listen for real-time updates from monitor thread
+    listen<AppSnapshot>("device-update", (event) => {
+      this.applySnapshot(event.payload);
+    });
+  }
+
+  private applySnapshot(snap: AppSnapshot) {
+    this.devices = snap.devices;
+    this.events = snap.events;
+    this.knownDevices = snap.known_devices;
+    this.storageInfo = snap.storage_info;
+    if (snap.error) this.error = snap.error;
+  }
+
+  selectDevice(id: string | null) {
+    if (id && this.knownDevices[id]) {
+      this.nicknameBuf = this.knownDevices[id].nickname ?? "";
+    } else {
+      this.nicknameBuf = "";
+    }
+    this.selectedDevice = id;
+  }
+
+  async saveNickname() {
+    if (!this.selectedDevice) return;
+    await cmd.setNickname(this.selectedDevice, this.nicknameBuf);
+    // Update local state
+    const dev = this.knownDevices[this.selectedDevice];
+    if (dev) {
+      dev.nickname = this.nicknameBuf.trim() || null;
+      this.knownDevices = { ...this.knownDevices };
+    }
+    this.notify("Nickname saved", "success");
+  }
+
+  async forgetDevice(id: string) {
+    await cmd.forgetDevice(id);
+    const updated = { ...this.knownDevices };
+    delete updated[id];
+    this.knownDevices = updated;
+    const si = { ...this.storageInfo };
+    delete si[id];
+    this.storageInfo = si;
+    if (this.selectedDevice === id) this.selectedDevice = null;
+    this.notify("Device forgotten", "info");
+  }
+
+  async clearEvents() {
+    await cmd.clearEvents();
+    this.events = [];
+  }
+
+  async setTheme(id: string) {
+    this.theme = id;
+    await cmd.setTheme(id);
+  }
+
+  async setActiveTab(tab: "monitor" | "known") {
+    this.activeTab = tab;
+    this.selectedDevice = null;
+    await cmd.setTab(tab);
+  }
+
+  toggleSort(mode: SortMode) {
+    if (this.sortMode === mode) {
+      this.sortAscending = !this.sortAscending;
+    } else {
+      this.sortMode = mode;
+      this.sortAscending = true;
+    }
+  }
+
+  notify(text: string, kind: string = "info") {
+    const id = this.nextNotifId++;
+    this.notifications = [...this.notifications, { id, text, kind }];
+    setTimeout(() => {
+      this.notifications = this.notifications.filter((n) => n.id !== id);
+    }, 2500);
+  }
+
+  async copyToClipboard(text: string) {
+    await cmd.copyToClipboard(text);
+    this.notify("Copied to clipboard", "success");
+  }
+
+  async openUrl(url: string) {
+    await cmd.openUrl(url);
+  }
+
+  getStorageForDevice(deviceId: string): StorageInfo | null {
+    return (
+      this.storageInfo[deviceId] ??
+      this.knownDevices[deviceId]?.storage_info ??
+      null
+    );
+  }
+}
+
+export const app = new AppState();

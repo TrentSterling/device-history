@@ -1,0 +1,32 @@
+[package]
+name = "device-history"
+version = "0.8.0"
+edition = "2021"
+description = "WTF just disconnected? USB device monitor with premium UI"
+
+[lib]
+name = "device_history_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-clipboard-manager = "2"
+tauri-plugin-shell = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wmi = "0.14"
+chrono = "0.4"
+colored = "2"
+ureq = "2"
+parking_lot = "0.12"
+log = "0.4"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true
