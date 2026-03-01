@@ -1,264 +1,427 @@
 <script lang="ts">
   import { app } from '../../lib/stores/app.svelte';
+  import { relativeDate } from '../../lib/utils';
   import CapacityBar from './CapacityBar.svelte';
 
   let { deviceId, isConnected }: { deviceId: string; isConnected: boolean } = $props();
 
   let kd = $derived(app.knownDevices[deviceId] ?? null);
   let si = $derived(app.getStorageForDevice(deviceId));
+  let hasStorage = $derived(!!si);
+
+  type DetailTab = 'info' | 'storage' | 'history';
+  let activeTab = $state<DetailTab>('info');
+
+  // Reset to info tab if storage disappears while on storage tab
+  $effect(() => {
+    if (activeTab === 'storage' && !hasStorage) {
+      activeTab = 'info';
+    }
+  });
+
+  // Device events for sparkline (most recent 30)
+  let deviceEvents = $derived(
+    app.events
+      .filter(e => e.device_id === deviceId)
+      .slice(-30)
+  );
 </script>
 
-<div class="detail-panel anim-slide-in">
-  <!-- Storage info -->
-  {#if si}
-    <div class="section-label">💿 STORAGE</div>
-    {#each si.volumes as vol}
-      <div class="vol-header">
-        <span class="vol-drive">💿 {vol.drive_letter}</span>
-        {#if vol.volume_name}
-          <span class="vol-name">"{vol.volume_name}"</span>
-        {/if}
-        <span class="vol-fs">({vol.file_system})</span>
-      </div>
-      <CapacityBar total={vol.total_bytes} free={vol.free_bytes} />
-    {/each}
+<div class="detail-panel">
+  <!-- Tab bar -->
+  <div class="detail-tabs">
+    <button
+      class:active={activeTab === 'info'}
+      onclick={() => activeTab = 'info'}
+    >Info</button>
+    {#if hasStorage}
+      <button
+        class:active={activeTab === 'storage'}
+        onclick={() => activeTab = 'storage'}
+      >Storage</button>
+    {/if}
+    <button
+      class:active={activeTab === 'history'}
+      onclick={() => activeTab = 'history'}
+    >History</button>
+    <button class="close-btn" onclick={() => app.selectDevice(null)}>&#10005;</button>
+  </div>
 
-    <div class="info-row model-row">
-      <span class="info-val">{si.model}</span>
-      {#if si.serial_number}
-        <span class="info-sec">🔑 {si.serial_number}</span>
+  <!-- Tab content -->
+  {#key activeTab}
+    <div class="detail-content">
+
+      {#if activeTab === 'info'}
+        <!-- Nickname -->
+        <div class="nickname-row">
+          <input
+            type="text"
+            placeholder="e.g. My 4TB Seagate"
+            bind:value={app.nicknameBuf}
+          />
+          <button class="action-btn" onclick={() => app.saveNickname()}>Save</button>
+        </div>
+
+        <!-- Device metadata grid -->
+        {#if kd}
+          <div class="info-grid">
+            <span class="info-label">Name</span>
+            <span class="info-value">{kd.name}</span>
+
+            <span class="info-label">VID:PID</span>
+            <span class="info-value">{kd.vid_pid || '\u2014'}</span>
+
+            <span class="info-label">Class</span>
+            <span class="info-value">{kd.class}</span>
+
+            <span class="info-label">Manufacturer</span>
+            <span class="info-value">{kd.manufacturer || '\u2014'}</span>
+
+            <span class="info-label">Description</span>
+            <span class="info-value">{kd.description || '\u2014'}</span>
+          </div>
+
+          <!-- Device ID row -->
+          <div class="device-id-row">
+            <span class="device-id-text">{kd.device_id}</span>
+            <button class="action-btn" onclick={() => app.copyToClipboard(kd!.device_id)}>Copy</button>
+          </div>
+        {/if}
+
+        <!-- Actions -->
+        <div class="action-row">
+          {#if si?.serial_number}
+            <button class="action-btn" onclick={() => app.copyToClipboard(si!.serial_number)}>Copy Serial</button>
+          {/if}
+          <button class="action-btn danger" onclick={() => app.forgetDevice(deviceId)}>Forget Device</button>
+        </div>
+
+      {:else if activeTab === 'storage' && si}
+        <!-- Offline notice -->
+        {#if !isConnected}
+          <div class="offline-notice">Device is offline — storage info may be stale</div>
+        {/if}
+
+        <!-- Volume cards -->
+        {#each si.volumes as vol}
+          <div class="volume-card">
+            <div class="volume-header">
+              <span class="drive-letter">{vol.drive_letter}</span>
+              {#if vol.volume_name}
+                <span class="volume-name">{vol.volume_name}</span>
+              {/if}
+              <span class="fs-badge">{vol.file_system}</span>
+            </div>
+            <CapacityBar total={vol.total_bytes} free={vol.free_bytes} />
+          </div>
+        {/each}
+
+        <!-- Drive metadata -->
+        <div class="info-grid" style="margin-top: 8px;">
+          {#if si.model}
+            <span class="info-label">Model</span>
+            <span class="info-value">{si.model}</span>
+          {/if}
+          {#if si.serial_number}
+            <span class="info-label">Serial</span>
+            <span class="info-value">{si.serial_number}</span>
+          {/if}
+          {#if si.interface_type}
+            <span class="info-label">Interface</span>
+            <span class="info-value">{si.interface_type}</span>
+          {/if}
+          {#if si.firmware}
+            <span class="info-label">Firmware</span>
+            <span class="info-value">{si.firmware}</span>
+          {/if}
+        </div>
+
+      {:else if activeTab === 'history'}
+        {#if kd}
+          <!-- Stats row -->
+          <div class="history-stats">
+            <div class="history-stat">
+              <span class="value">{relativeDate(kd.first_seen)}</span>
+              <span class="label" title={kd.first_seen}>First seen</span>
+            </div>
+            <div class="history-stat">
+              <span class="value">{relativeDate(kd.last_seen)}</span>
+              <span class="label" title={kd.last_seen}>Last seen</span>
+            </div>
+            <div class="history-stat">
+              <span class="value">{kd.times_seen}</span>
+              <span class="label">Times seen</span>
+            </div>
+          </div>
+
+          <!-- Sparkline -->
+          {#if deviceEvents.length > 0}
+            <div class="sparkline">
+              {#each deviceEvents as evt}
+                <div
+                  class="spark-dot {evt.kind === 'connect' ? 'connect' : 'disconnect'}"
+                  title="{evt.kind} — {evt.timestamp}"
+                ></div>
+              {/each}
+            </div>
+          {:else}
+            <div class="no-history">No event history recorded</div>
+          {/if}
+        {/if}
       {/if}
     </div>
-
-    {#if !isConnected}
-      <div class="offline-notice">⚠️ OFFLINE — showing last known info</div>
-    {/if}
-
-    <div class="separator"></div>
-
-    {#if si.interface_type}
-      <div class="info-row"><span class="info-label">🔗 Interface:</span> <span class="info-val">{si.interface_type}</span></div>
-    {/if}
-    {#if si.firmware}
-      <div class="info-row"><span class="info-label">⚙️ Firmware:</span> <span class="info-val">{si.firmware}</span></div>
-    {/if}
-    {#if si.status}
-      <div class="info-row"><span class="info-label">📊 Status:</span> <span class="info-val">{si.status}</span></div>
-    {/if}
-
-    <div class="separator"></div>
-  {:else if kd}
-    <div class="dev-name">🔌 {kd.name}</div>
-  {/if}
-
-  <!-- Nickname editing -->
-  <div class="section-label">✏️ NICKNAME</div>
-  <div class="nickname-row">
-    <input
-      type="text"
-      placeholder="e.g. My 4TB Seagate"
-      bind:value={app.nicknameBuf}
-    />
-    <button class="save-btn" onclick={() => app.saveNickname()}>💾 Save</button>
-  </div>
-
-  <!-- Device info -->
-  {#if kd}
-    <div class="separator"></div>
-    <div class="section-label">📋 DEVICE INFO</div>
-    <div class="info-row"><span class="info-label">ID:</span> <span class="info-val mono">{kd.device_id}</span></div>
-    <div class="info-row"><span class="info-label">VID:PID:</span> <span class="info-val">{kd.vid_pid || '—'}</span></div>
-    <div class="info-row"><span class="info-label">Class:</span> <span class="info-val class-val">{kd.class}</span></div>
-    <div class="info-row"><span class="info-label">Manufacturer:</span> <span class="info-val">{kd.manufacturer || '—'}</span></div>
-    <div class="info-row"><span class="info-label">Description:</span> <span class="info-val">{kd.description || '—'}</span></div>
-
-    <div class="separator"></div>
-    <div class="section-label">📅 HISTORY</div>
-    <div class="history-row">
-      <span>📅 First: {kd.first_seen}</span>
-      <span>🕐 Last: {kd.last_seen}</span>
-      <span class="times-seen">🔄 {kd.times_seen}x</span>
-    </div>
-  {/if}
-
-  <!-- Actions -->
-  <div class="separator"></div>
-  <div class="action-row">
-    <button class="action-btn copy-btn" onclick={() => app.copyToClipboard(deviceId)}>📋 Copy ID</button>
-    {#if si?.serial_number}
-      <button class="action-btn copy-btn" onclick={() => app.copyToClipboard(si!.serial_number)}>🔑 Copy Serial</button>
-    {/if}
-    <button class="action-btn danger" onclick={() => app.forgetDevice(deviceId)}>🗑️ Forget</button>
-  </div>
+  {/key}
 </div>
 
 <style>
   .detail-panel {
-    padding: 10px 12px;
+    background: var(--bg-surface);
+    border: 1px solid var(--border);
+    border-top: none;
+    animation: expandHeight 350ms cubic-bezier(0.34, 1.56, 0.64, 1);
+  }
+
+  .detail-tabs {
     display: flex;
-    flex-direction: column;
-    gap: 4px;
+    gap: 0;
+    border-bottom: 1px solid var(--border);
+    padding: 0 12px;
+    background: var(--bg-elevated);
   }
-  .section-label {
-    font-size: 11px;
+
+  .detail-tabs button {
+    padding: 8px 16px;
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    cursor: pointer;
+    font-size: 12px;
     font-weight: 600;
-    color: var(--cyan);
-    letter-spacing: 0.5px;
-    margin-top: 4px;
-    padding-bottom: 2px;
+    border-bottom: 2px solid transparent;
+    transition: color 150ms, border-color 150ms;
   }
-  .vol-header {
+
+  .detail-tabs button.active {
+    color: var(--accent);
+    border-bottom-color: var(--accent);
+  }
+
+  .detail-tabs button:hover:not(.active) {
+    color: var(--text);
+  }
+
+  .close-btn {
+    margin-left: auto !important;
+    color: var(--text-muted);
+    font-size: 16px;
+    padding: 8px 12px !important;
+  }
+
+  .close-btn:hover {
+    color: var(--red);
+  }
+
+  .detail-content {
+    padding: 14px;
+    animation: crossfadeIn 150ms ease;
+  }
+
+  .info-grid {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 6px 12px;
+    font-size: 12px;
+  }
+
+  .info-label {
+    color: var(--text-muted);
+    font-weight: 500;
+  }
+
+  .info-value {
+    color: var(--text);
+    word-break: break-all;
+  }
+
+  .device-id-row {
     display: flex;
     align-items: center;
     gap: 8px;
+    margin-top: 10px;
+    padding: 8px;
+    background: var(--bg-deep);
+    border-radius: 6px;
+    border: 1px solid var(--border);
   }
-  .vol-drive {
-    font-size: 18px;
-    color: var(--green);
-    font-weight: 600;
-  }
-  .vol-name {
-    font-size: 15px;
-    color: var(--text);
-    font-weight: 500;
-  }
-  .vol-fs {
-    font-size: 11px;
-    color: var(--text-sec);
-  }
-  .dev-name {
-    font-size: 14px;
-    color: var(--text);
-    font-weight: 500;
-    padding: 4px 0;
-  }
-  .offline-notice {
+
+  .device-id-text {
+    font-family: "Cascadia Code", "Consolas", monospace;
     font-size: 10px;
-    color: var(--orange);
-    margin-top: 2px;
-    padding: 3px 8px;
-    background: color-mix(in srgb, var(--orange) 8%, transparent);
-    border-radius: 4px;
-    border: 1px solid color-mix(in srgb, var(--orange) 20%, transparent);
-  }
-  .model-row {
-    margin-top: 2px;
-  }
-  .info-row {
-    display: flex;
-    gap: 6px;
-    font-size: 11px;
-    line-height: 1.6;
-  }
-  .info-label {
-    color: var(--text-sec);
-    flex-shrink: 0;
-  }
-  .info-val {
-    color: var(--text);
-  }
-  .info-sec {
-    color: var(--text-sec);
-    font-size: 10px;
-  }
-  .class-val {
-    color: var(--accent);
-  }
-  .mono {
-    font-family: 'Cascadia Code', 'Consolas', monospace;
-    font-size: 10px;
-    word-break: break-all;
     color: var(--text-muted);
+    flex: 1;
+    word-break: break-all;
   }
-  .history-row {
-    display: flex;
-    gap: 14px;
-    font-size: 11px;
-    color: var(--text-sec);
-    flex-wrap: wrap;
-  }
-  .times-seen {
-    color: var(--teal);
-    font-weight: 600;
-  }
-  .separator {
-    height: 1px;
-    background: linear-gradient(90deg, transparent, var(--border), transparent);
-    margin: 4px 0;
-  }
+
   .nickname-row {
     display: flex;
+    gap: 8px;
     align-items: center;
-    gap: 6px;
-    margin: 2px 0;
+    margin-bottom: 12px;
   }
+
   .nickname-row input {
     flex: 1;
-    max-width: 240px;
-    font-size: 12px;
-    padding: 4px 8px;
+    padding: 6px 10px;
     background: var(--bg-deep);
     border: 1px solid var(--border);
     border-radius: 6px;
-    color: var(--text);
+    color: var(--teal);
+    font-size: 12px;
     outline: none;
-    transition: border-color 200ms ease, box-shadow 200ms ease;
+    transition: border-color 150ms;
   }
+
   .nickname-row input:focus {
     border-color: var(--teal);
-    box-shadow: 0 0 8px color-mix(in srgb, var(--teal) 20%, transparent);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--teal) 20%, transparent);
   }
+
   .nickname-row input::placeholder {
     color: var(--text-muted);
     font-size: 11px;
   }
-  .save-btn {
-    padding: 4px 10px;
-    font-size: 11px;
-    font-weight: 500;
+
+  .volume-card {
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 12px;
+    margin-bottom: 8px;
+  }
+
+  .volume-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+  }
+
+  .drive-letter {
+    font-size: 16px;
+    font-weight: 700;
+    color: var(--green);
+  }
+
+  .volume-name {
+    font-size: 13px;
+    color: var(--text);
+  }
+
+  .fs-badge {
+    font-size: 10px;
+    color: var(--text-muted);
+    background: var(--bg-deep);
+    padding: 2px 6px;
+    border-radius: 4px;
+    margin-left: auto;
+  }
+
+  .history-stats {
+    display: flex;
+    gap: 20px;
+    margin-bottom: 16px;
+  }
+
+  .history-stat {
+    text-align: center;
+  }
+
+  .history-stat .value {
+    font-size: 18px;
+    font-weight: 700;
     color: var(--teal);
-    border: 1px solid var(--teal);
+    display: block;
+  }
+
+  .history-stat .label {
+    font-size: 11px;
+    color: var(--text-muted);
+    display: block;
+  }
+
+  .sparkline {
+    display: flex;
+    gap: 4px;
+    align-items: center;
+    padding: 12px;
+    background: var(--bg-deep);
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    overflow-x: auto;
+  }
+
+  .spark-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+
+  .spark-dot.connect {
+    background: var(--green);
+  }
+
+  .spark-dot.disconnect {
+    background: var(--red);
+  }
+
+  .no-history {
+    font-size: 12px;
+    color: var(--text-muted);
+    text-align: center;
+    padding: 16px;
+  }
+
+  .offline-notice {
+    padding: 8px 12px;
+    background: color-mix(in srgb, var(--orange) 10%, transparent);
+    border: 1px solid color-mix(in srgb, var(--orange) 30%, transparent);
     border-radius: 6px;
-    background: transparent;
-    cursor: pointer;
-    transition: all 180ms ease;
+    color: var(--orange);
+    font-size: 11px;
+    margin-bottom: 8px;
   }
-  .save-btn:hover {
-    background: color-mix(in srgb, var(--teal) 12%, transparent);
-    box-shadow: 0 0 8px color-mix(in srgb, var(--teal) 20%, transparent);
-  }
+
   .action-row {
     display: flex;
-    gap: 6px;
+    gap: 8px;
+    margin-top: 12px;
     flex-wrap: wrap;
   }
+
   .action-btn {
-    padding: 4px 10px;
-    font-size: 11px;
-    font-weight: 500;
+    padding: 6px 12px;
     border-radius: 6px;
-    cursor: pointer;
-    transition: all 180ms ease;
-  }
-  .copy-btn {
-    color: var(--text-sec);
     border: 1px solid var(--border);
-    background: transparent;
+    background: none;
+    color: var(--text-sec);
+    font-size: 11px;
+    cursor: pointer;
+    transition: all 150ms;
   }
-  .copy-btn:hover {
+
+  .action-btn:hover {
     border-color: var(--accent);
     color: var(--accent);
-    background: color-mix(in srgb, var(--accent) 8%, transparent);
-    box-shadow: 0 0 6px color-mix(in srgb, var(--accent) 15%, transparent);
   }
+
   .action-btn.danger {
+    border-color: color-mix(in srgb, var(--red) 30%, transparent);
     color: var(--red);
-    border: 1px solid color-mix(in srgb, var(--red) 40%, transparent);
-    background: transparent;
   }
+
   .action-btn.danger:hover {
-    border-color: var(--red);
     background: color-mix(in srgb, var(--red) 10%, transparent);
-    box-shadow: 0 0 6px color-mix(in srgb, var(--red) 20%, transparent);
+    border-color: var(--red);
   }
 </style>
